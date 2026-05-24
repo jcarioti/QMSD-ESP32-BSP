@@ -6,6 +6,10 @@
 
 #include "screen_driver.h"
 
+#include "esp_log.h"
+
+#define TAG "QMSD_SCREEN_RGB"
+
 esp_lcd_panel_handle_t g_rgb_panel_handle = NULL;
 
 static esp_err_t qmsd_screen_init(const scr_controller_config_t *lcd_conf);
@@ -50,7 +54,8 @@ static esp_err_t qmsd_screen_init(const scr_controller_config_t *lcd_conf) {
             LCD_D14_GPIO,
             LCD_D15_GPIO,
         },
-        .bounce_buffer_size_px = QMSD_RGB_CLK_FREQ > 15000000 ? QMSD_SCREEN_WIDTH * 16 : 0,
+        .bounce_buffer_size_px = QMSD_RGB_CLK_FREQ > 15000000 ? QMSD_SCREEN_WIDTH * 20 : 0,
+        // .bounce_buffer_size_px = QMSD_SCREEN_WIDTH / 2, // USE THIS TO CHECK FOR TIMING BUGS
         .clk_src = USER_RGB_CLK_SRC_PLL240M,
         .timings = {
             .pclk_hz = QMSD_RGB_CLK_FREQ,
@@ -67,6 +72,7 @@ static esp_err_t qmsd_screen_init(const scr_controller_config_t *lcd_conf) {
         .flags = {
             .fb_in_psram = 1,
             .double_fb = 1,
+            // .double_fb = 0, // USE THIS TO CHECK FOR TIMING BUGS
             .avoid_te = 1,
         },
     };
@@ -84,7 +90,10 @@ static esp_err_t qmsd_screen_draw_pixel(uint16_t x, uint16_t y, uint16_t color) 
 }
 
 static esp_err_t qmsd_screen_drawbitmap(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
-    g_rgb_panel_handle->draw_bitmap(g_rgb_panel_handle, x, y, x + w, y + h, (void *)bitmap);
+    esp_err_t err = g_rgb_panel_handle->draw_bitmap(g_rgb_panel_handle, x, y, x + w, y + h, (void *)bitmap);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to draw bitmap: %d", err);
+    }
     vTaskDelay(pdMS_TO_TICKS(2));
-    return ESP_OK;
+    return err;
 }

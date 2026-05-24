@@ -94,6 +94,14 @@ qmsd_err_t touch_read_points(touch_panel_points_t *point);
 
 uint32_t touch_get_last_press_ticks();
 
+/**
+ * @brief Return the number of pending touch samples buffered for consumers (e.g. LVGL).
+ *
+ * When the touch task is enabled, samples are queued so the GUI can drain them without
+ * relying on precise task timing.
+ */
+uint32_t touch_samples_waiting(void);
+
 void touch_deinit();
 
 #ifdef __cplusplus
