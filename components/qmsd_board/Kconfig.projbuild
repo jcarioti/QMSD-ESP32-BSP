@@ -45,6 +45,16 @@ menu "QMSD Hal"
             bool "Rotate 270 Degree"
     endchoice
 
+    config QMSD_SCREEN_20_MHZ_CLK
+        bool "Use 20 MHz RGB panel clock"
+        depends on ZX3D95CE01S_TR_4848
+        default y
+        help
+            Use the vendor 20 MHz RGB panel timing table for the
+            ZX3D95CE01S_TR_4848 board. Disable this option to use the
+            alternate 16 MHz timing table for panels that need more
+            conservative RGB timing.
+
     menu "QMSD Board Backlight"
         config QMSD_BOARD_BACKLIGHT_VALUE
             int "Init value"

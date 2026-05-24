@@ -5,15 +5,10 @@
 
 #define QMSD_SCREEN_BK_FREQ     11111
 
-// 20 MHz is the BSP default. Keep a 16 MHz fallback for panels that show
-// timing-sensitive shifting or tearing. To stress timing during validation,
-// see the comments around .bounce_buffer_size_px and .double_fb in
-// qmsd_screen_rgb.c.
-#ifndef QMSD_SCREEN_20_MHZ_CLK
-#define QMSD_SCREEN_20_MHZ_CLK 1
-#endif
-
-#if QMSD_SCREEN_20_MHZ_CLK
+// Enable CONFIG_QMSD_SCREEN_20_MHZ_CLK for the vendor timing table. Disable it
+// to use the alternate 16 MHz timing table for panels that need more
+// conservative RGB timing.
+#ifdef CONFIG_QMSD_SCREEN_20_MHZ_CLK
 #define QMSD_RGB_CLK_FREQ           (20000000)
 #define QMSD_RGB_HSYNC_PULSE_WIDTH  (48)
 #define QMSD_RGB_HSYNC_BACK_PORCH   (40)
