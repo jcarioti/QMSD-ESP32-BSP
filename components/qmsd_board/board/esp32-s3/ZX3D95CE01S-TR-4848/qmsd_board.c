@@ -1,6 +1,6 @@
 #include "string.h"
 #include <inttypes.h>
-#include "hal/gpio_hal.h"
+#include "driver/gpio.h"
 #include "qmsd_board.h"
 #include "qmsd_utils.h"
 #include "screen_utility.h"
@@ -18,7 +18,7 @@ static void touch_read(uint8_t* press, uint16_t* x, uint16_t* y);
 void qmsd_board_init(qmsd_board_config_t* config) {
     memcpy(&g_board_config, config, sizeof(qmsd_board_config_t));
     if (BOARD_RESET_PIN > -1) {
-        gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[BOARD_RESET_PIN], PIN_FUNC_GPIO);
+        gpio_reset_pin(BOARD_RESET_PIN);
         gpio_set_direction(BOARD_RESET_PIN, GPIO_MODE_OUTPUT);
         gpio_set_level(BOARD_RESET_PIN, 0);
         vTaskDelay(pdMS_TO_TICKS(2));
@@ -39,7 +39,7 @@ void qmsd_board_init(qmsd_board_config_t* config) {
 
 void qmsd_board_init_screen() {
     if (LCD_DISP_EN_GPIO > -1) {
-        gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[LCD_DISP_EN_GPIO], PIN_FUNC_GPIO);
+        gpio_reset_pin(LCD_DISP_EN_GPIO);
         gpio_set_direction(LCD_DISP_EN_GPIO, GPIO_MODE_OUTPUT);
         gpio_set_level(LCD_DISP_EN_GPIO, 1);
         vTaskDelay(pdMS_TO_TICKS(10));

@@ -7,7 +7,14 @@
 #ifndef   __I2S_LCD_DRIVER_H__
 #define   __I2S_LCD_DRIVER_H__
 
+#include "esp_idf_version.h"
+
+#if ESP_IDF_VERSION_MAJOR >= 6
+#include "driver/i2s_types.h"
+typedef int i2s_port_t;
+#else
 #include "driver/i2s.h"
+#endif
 
 #ifdef __cplusplus
 extern "C"

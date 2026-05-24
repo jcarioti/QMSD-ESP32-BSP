@@ -6,7 +6,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 
+#include "esp_idf_version.h"
+
+#if ESP_IDF_VERSION_MAJOR < 6
 #include "driver/adc.h"
+#endif
 
 typedef void *btn_handle_t;
 typedef void (*btn_callback_t)(btn_handle_t handle, void* user_data);
@@ -58,7 +62,9 @@ btn_handle_t qmsd_button_create(btn_get_level_fun_t get_level, void* hardware_da
 
 btn_handle_t qmsd_button_create_gpio(uint8_t gpio_num, uint8_t active_level, void* user_data);
 
+#if ESP_IDF_VERSION_MAJOR < 6
 btn_handle_t qmsd_button_create_adc(adc1_channel_t adc_channel, uint16_t middle_volt_mv, uint16_t diff_volt_mv, void* user_data);
+#endif
 
 void qmsd_button_register_cb(btn_handle_t handle, press_event_t event, btn_callback_t cb);
 
