@@ -109,6 +109,9 @@ menu "QMSD Hal"
         config QMSD_GUI_FULL_REFRESH
             bool "Gui driver full refresh"
             default n
+        config QMSD_GUI_DIRECT_MODE
+            bool "Gui driver direct render mode"
+            default n
         config QMSD_GUI_REFRESH_THREAD_EN
             bool "Gui enable refresh in thread"
             default y

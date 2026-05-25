@@ -77,12 +77,13 @@ void qmsd_board_init_gui() {
         ESP_LOGW(TAG, "Only support BOARD_ROTATION_0");
         g_board_config.board_dir = BOARD_ROTATION_0;
     }
-    if (g_board_config.gui.buffer_size != 0 && g_board_config.gui.flags.full_refresh) {
-        ESP_LOGW(TAG, "ignore gui buffer size when full refresh");
+    if (g_board_config.gui.buffer_size != 0 &&
+        (g_board_config.gui.flags.full_refresh || g_board_config.gui.flags.direct_mode)) {
+        ESP_LOGW(TAG, "ignore gui buffer size when using screen-sized frame buffers");
     }
 
     uint8_t buffer_num = 2;
-    if (g_board_config.gui.flags.full_refresh == 0) {
+    if (g_board_config.gui.flags.full_refresh == 0 && g_board_config.gui.flags.direct_mode == 0) {
         for (uint8_t i = 0; i < buffer_num; i++) {
             if (g_board_config.gui.flags.fb_in_psram) {
                 buffers[i] = (uint8_t *)QMSD_MALLOC_PSRAM(buffer_size);
