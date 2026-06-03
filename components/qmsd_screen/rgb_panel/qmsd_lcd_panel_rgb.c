@@ -36,7 +36,7 @@
 #include "hal/gpio_hal.h"
 #include "esp_private/gdma.h"
 #include "driver/gpio.h"
-#if ESP_IDF_VERSION_MAJOR == 5
+#if ESP_IDF_VERSION_MAJOR >= 5
 #include "esp_private/periph_ctrl.h"
 #if CONFIG_SPIRAM
 #include "esp_psram.h"
@@ -49,7 +49,11 @@
 #endif
 #include "esp_lcd_common.h"
 #include "esp_timer.h"
+#if ESP_IDF_VERSION_MAJOR >= 6
+#include "hal/lcd_periph.h"
+#else
 #include "soc/lcd_periph.h"
+#endif
 #include "hal/lcd_hal.h"
 #include "hal/lcd_ll.h"
 #include "hal/gdma_ll.h"
@@ -62,18 +66,44 @@
 #include "esp_private/esp_dma_utils.h"
 #include "esp_private/periph_ctrl.h"
 #include "esp_private/gpio.h"
+#if ESP_IDF_VERSION_MAJOR < 6
 #define lcd_periph_signals lcd_periph_rgb_signals
+#endif
+#endif
+
+#if ESP_IDF_VERSION_MAJOR >= 6
+#define QMSD_LCD_PERIPH(panel_id) soc_lcd_rgb_signals[(panel_id)]
+#else
+#define QMSD_LCD_PERIPH(panel_id) lcd_periph_signals.panels[(panel_id)]
 #endif
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
 #define lcd_ll_set_data_width(x, y) lcd_ll_set_dma_read_stride(x, y)
 #if defined(SOC_GDMA_TRIG_PERIPH_LCD0_BUS) && (SOC_GDMA_TRIG_PERIPH_LCD0_BUS == SOC_GDMA_BUS_AHB)
-#define LCD_GDMA_NEW_CHANNEL gdma_new_ahb_channel
+#if ESP_IDF_VERSION_MAJOR >= 6
+#define LCD_GDMA_NEW_CHANNEL(config, ret_chan) gdma_new_ahb_channel((config), (ret_chan), NULL)
+#else
+#define LCD_GDMA_NEW_CHANNEL(config, ret_chan) gdma_new_ahb_channel((config), (ret_chan))
+#endif
 #define LCD_GDMA_DESCRIPTOR_ALIGN 4
 #elif defined(SOC_GDMA_TRIG_PERIPH_LCD0_BUS) && (SOC_GDMA_TRIG_PERIPH_LCD0_BUS == SOC_GDMA_BUS_AXI)
-#define LCD_GDMA_NEW_CHANNEL gdma_new_axi_channel
+#if ESP_IDF_VERSION_MAJOR >= 6
+#define LCD_GDMA_NEW_CHANNEL(config, ret_chan) gdma_new_axi_channel((config), (ret_chan), NULL)
+#else
+#define LCD_GDMA_NEW_CHANNEL(config, ret_chan) gdma_new_axi_channel((config), (ret_chan))
+#endif
 #define LCD_GDMA_DESCRIPTOR_ALIGN 8
 #endif
+#endif
+
+#ifndef LCD_LL_EVENT_RGB
+#define LCD_LL_EVENT_RGB LCD_LL_EVENT_VSYNC_END
+#endif
+
+#if ESP_IDF_VERSION_MAJOR >= 6
+#define QMSD_GPIO_FUNC_SEL(gpio_num) gpio_reset_pin((gpio_num_t)(gpio_num))
+#else
+#define QMSD_GPIO_FUNC_SEL(gpio_num) gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[(gpio_num)], PIN_FUNC_GPIO)
 #endif
 
 #if CONFIG_LCD_RGB_ISR_IRAM_SAFE
@@ -95,7 +125,7 @@ static esp_err_t rgb_panel_invert_color(esp_lcd_panel_t *panel, bool invert_colo
 static esp_err_t rgb_panel_mirror(esp_lcd_panel_t *panel, bool mirror_x, bool mirror_y);
 static esp_err_t rgb_panel_swap_xy(esp_lcd_panel_t *panel, bool swap_axes);
 static esp_err_t rgb_panel_set_gap(esp_lcd_panel_t *panel, int x_gap, int y_gap);
-#if ESP_IDF_VERSION_MAJOR == 5
+#if ESP_IDF_VERSION_MAJOR >= 5
 static esp_err_t rgb_panel_disp_on_off(esp_lcd_panel_t *panel, bool off);
 #endif
 static uint32_t qmsd_lcd_hal_cal_pclk_freq(lcd_hal_context_t *hal, uint32_t src_freq_hz, uint32_t expect_pclk_freq_hz, int lcd_clk_flags);
@@ -199,7 +229,15 @@ static esp_err_t lcd_rgb_panel_destory(esp_rgb_panel_t *rgb_panel)
 {
     lcd_ll_enable_clock(rgb_panel->hal.dev, false);
     if (rgb_panel->panel_id >= 0) {
-        periph_module_disable(lcd_periph_signals.panels[rgb_panel->panel_id].module);
+#if ESP_IDF_VERSION_MAJOR >= 6
+        PERIPH_RCC_RELEASE_ATOMIC(QMSD_LCD_PERIPH(rgb_panel->panel_id).module, ref_count) {
+            if (ref_count == 0) {
+                lcd_ll_enable_bus_clock(rgb_panel->panel_id, false);
+            }
+        }
+#else
+        periph_module_disable(QMSD_LCD_PERIPH(rgb_panel->panel_id).module);
+#endif
         lcd_com_remove_device(LCD_COM_DEVICE_TYPE_RGB, rgb_panel->panel_id);
     }
     if (rgb_panel->fbs[0]) {
@@ -297,15 +335,15 @@ esp_err_t qmsd_lcd_new_rgb_panel(const qmsd_lcd_rgb_panel_config_t *rgb_panel_co
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
     // enable APB to access LCD registers
-    PERIPH_RCC_ACQUIRE_ATOMIC(lcd_periph_signals.panels[panel_id].module, ref_count) {
+    PERIPH_RCC_ACQUIRE_ATOMIC(QMSD_LCD_PERIPH(panel_id).module, ref_count) {
         if (ref_count == 0) {
             lcd_ll_enable_bus_clock(panel_id, true);
             lcd_ll_reset_register(panel_id);
         }
     }
 #else
-    periph_module_enable(lcd_periph_signals.panels[panel_id].module);
-    periph_module_reset(lcd_periph_signals.panels[panel_id].module);
+    periph_module_enable(QMSD_LCD_PERIPH(panel_id).module);
+    periph_module_reset(QMSD_LCD_PERIPH(panel_id).module);
 #endif
     // allocate frame buffers + bounce buffers
     ESP_GOTO_ON_ERROR(lcd_rgb_panel_alloc_frame_buffers(rgb_panel_config, rgb_panel), err, TAG, "alloc frame buffers failed");
@@ -319,11 +357,13 @@ esp_err_t qmsd_lcd_new_rgb_panel(const qmsd_lcd_rgb_panel_config_t *rgb_panel_co
     ESP_GOTO_ON_ERROR(ret, err, TAG, "set source clock failed");
     // install interrupt service, (LCD peripheral shares the interrupt source with Camera by different mask)
     int isr_flags = LCD_RGB_INTR_ALLOC_FLAGS | ESP_INTR_FLAG_SHARED | ESP_INTR_FLAG_LOWMED;
-    ret = esp_intr_alloc_intrstatus(lcd_periph_signals.panels[panel_id].irq_id, isr_flags,
+    ret = esp_intr_alloc_intrstatus(QMSD_LCD_PERIPH(panel_id).irq_id, isr_flags,
                                     (uint32_t)lcd_ll_get_interrupt_status_reg(rgb_panel->hal.dev),
-                                    LCD_LL_EVENT_VSYNC_END, lcd_default_isr_handler, rgb_panel, &rgb_panel->intr);
+                                    LCD_LL_EVENT_RGB, lcd_default_isr_handler, rgb_panel, &rgb_panel->intr);
     ESP_GOTO_ON_ERROR(ret, err, TAG, "install interrupt failed");
-    lcd_ll_enable_interrupt(rgb_panel->hal.dev, LCD_LL_EVENT_VSYNC_END, false); // disable all interrupts
+    PERIPH_RCC_ATOMIC() {
+        lcd_ll_enable_interrupt(rgb_panel->hal.dev, LCD_LL_EVENT_RGB, false); // disable all interrupts
+    }
     lcd_ll_clear_interrupt_status(rgb_panel->hal.dev, UINT32_MAX); // clear pending interrupt
 
     // install DMA service
@@ -334,7 +374,7 @@ esp_err_t qmsd_lcd_new_rgb_panel(const qmsd_lcd_rgb_panel_config_t *rgb_panel_co
     ret = lcd_rgb_panel_configure_gpio(rgb_panel, rgb_panel_config);
     ESP_GOTO_ON_ERROR(ret, err, TAG, "configure GPIO failed");
     // fill other rgb panel runtime parameters
-    memcpy(rgb_panel->data_gpio_nums, rgb_panel_config->data_gpio_nums, SOC_LCD_RGB_DATA_WIDTH);
+    memcpy(rgb_panel->data_gpio_nums, rgb_panel_config->data_gpio_nums, sizeof(rgb_panel->data_gpio_nums));
     rgb_panel->timings = rgb_panel_config->timings;
     rgb_panel->data_width = rgb_panel_config->data_width;
     rgb_panel->bits_per_pixel = bits_per_pixel;
@@ -349,7 +389,7 @@ esp_err_t qmsd_lcd_new_rgb_panel(const qmsd_lcd_rgb_panel_config_t *rgb_panel_co
     rgb_panel->base.reset = rgb_panel_reset;
     rgb_panel->base.init = rgb_panel_init;
     rgb_panel->base.draw_bitmap = rgb_panel_draw_bitmap;
-#if ESP_IDF_VERSION_MAJOR == 5
+#if ESP_IDF_VERSION_MAJOR >= 5
     rgb_panel->base.disp_on_off = rgb_panel_disp_on_off;
 #endif
     rgb_panel->base.invert_color = rgb_panel_invert_color;
@@ -503,7 +543,9 @@ static esp_err_t rgb_panel_init(esp_lcd_panel_t *panel)
     // send next frame automatically in stream mode
     lcd_ll_enable_auto_next_frame(rgb_panel->hal.dev, rgb_panel->flags.stream_mode);
     // trigger interrupt on the end of frame
-    lcd_ll_enable_interrupt(rgb_panel->hal.dev, LCD_LL_EVENT_VSYNC_END, true);
+    PERIPH_RCC_ATOMIC() {
+        lcd_ll_enable_interrupt(rgb_panel->hal.dev, LCD_LL_EVENT_RGB, true);
+    }
     // enable intr
     esp_intr_enable(rgb_panel->intr);
     // start transmission
@@ -618,7 +660,7 @@ static esp_err_t rgb_panel_invert_color(esp_lcd_panel_t *panel, bool invert_colo
     int panel_id = rgb_panel->panel_id;
     // inverting the data line by GPIO matrix
     for (int i = 0; i < rgb_panel->data_width; i++) {
-        esp_rom_gpio_connect_out_signal(rgb_panel->data_gpio_nums[i], lcd_periph_signals.panels[panel_id].data_sigs[i],
+        esp_rom_gpio_connect_out_signal(rgb_panel->data_gpio_nums[i], QMSD_LCD_PERIPH(panel_id).data_sigs[i],
                                         invert_color_data, false);
     }
     return ESP_OK;
@@ -642,7 +684,7 @@ static esp_err_t rgb_panel_set_gap(esp_lcd_panel_t *panel, int x_gap, int y_gap)
     return ESP_OK;
 }
 
-#if ESP_IDF_VERSION_MAJOR == 5
+#if ESP_IDF_VERSION_MAJOR >= 5
 static esp_err_t rgb_panel_disp_on_off(esp_lcd_panel_t *panel, bool on_off)
 {
     esp_rgb_panel_t *rgb_panel = __containerof(panel, esp_rgb_panel_t, base);
@@ -675,42 +717,42 @@ static esp_err_t lcd_rgb_panel_configure_gpio(esp_rgb_panel_t *panel, const qmsd
     }
     // connect peripheral signals via GPIO matrix
     for (size_t i = 0; i < panel_config->data_width; i++) {
-        gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[panel_config->data_gpio_nums[i]], PIN_FUNC_GPIO);
+        QMSD_GPIO_FUNC_SEL(panel_config->data_gpio_nums[i]);
         gpio_set_direction(panel_config->data_gpio_nums[i], GPIO_MODE_OUTPUT);
         esp_rom_gpio_pad_set_drv(panel_config->data_gpio_nums[i], 0);
         esp_rom_gpio_connect_out_signal(panel_config->data_gpio_nums[i],
-                                        lcd_periph_signals.panels[panel_id].data_sigs[i], false, false);
+                                        QMSD_LCD_PERIPH(panel_id).data_sigs[i], false, false);
     }
     if (panel_config->hsync_gpio_num >= 0) {
-        gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[panel_config->hsync_gpio_num], PIN_FUNC_GPIO);
+        QMSD_GPIO_FUNC_SEL(panel_config->hsync_gpio_num);
         gpio_set_direction(panel_config->hsync_gpio_num, GPIO_MODE_OUTPUT);
         esp_rom_gpio_pad_set_drv(panel_config->hsync_gpio_num, 0);
         esp_rom_gpio_connect_out_signal(panel_config->hsync_gpio_num,
-                                        lcd_periph_signals.panels[panel_id].hsync_sig, false, false);
+                                        QMSD_LCD_PERIPH(panel_id).hsync_sig, false, false);
     }
     if (panel_config->vsync_gpio_num >= 0) {
-        gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[panel_config->vsync_gpio_num], PIN_FUNC_GPIO);
+        QMSD_GPIO_FUNC_SEL(panel_config->vsync_gpio_num);
         gpio_set_direction(panel_config->vsync_gpio_num, GPIO_MODE_OUTPUT);
         esp_rom_gpio_pad_set_drv(panel_config->vsync_gpio_num, 0);
         esp_rom_gpio_connect_out_signal(panel_config->vsync_gpio_num,
-                                        lcd_periph_signals.panels[panel_id].vsync_sig, false, false);
+                                        QMSD_LCD_PERIPH(panel_id).vsync_sig, false, false);
     }
-    gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[panel_config->pclk_gpio_num], PIN_FUNC_GPIO);
+    QMSD_GPIO_FUNC_SEL(panel_config->pclk_gpio_num);
     gpio_set_direction(panel_config->pclk_gpio_num, GPIO_MODE_OUTPUT);
     esp_rom_gpio_pad_set_drv(panel_config->pclk_gpio_num, 0);
     esp_rom_gpio_connect_out_signal(panel_config->pclk_gpio_num,
-                                    lcd_periph_signals.panels[panel_id].pclk_sig, false, false);
+                                    QMSD_LCD_PERIPH(panel_id).pclk_sig, false, false);
     // DE signal might not be necessary for some RGB LCD
     if (panel_config->de_gpio_num >= 0) {
-        gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[panel_config->de_gpio_num], PIN_FUNC_GPIO);
+        QMSD_GPIO_FUNC_SEL(panel_config->de_gpio_num);
         gpio_set_direction(panel_config->de_gpio_num, GPIO_MODE_OUTPUT);
         esp_rom_gpio_pad_set_drv(panel_config->de_gpio_num, 0);
         esp_rom_gpio_connect_out_signal(panel_config->de_gpio_num,
-                                        lcd_periph_signals.panels[panel_id].de_sig, false, false);
+                                        QMSD_LCD_PERIPH(panel_id).de_sig, false, false);
     }
     // disp enable GPIO is optional
     if (panel_config->disp_gpio_num >= 0) {
-        gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[panel_config->disp_gpio_num], PIN_FUNC_GPIO);
+        QMSD_GPIO_FUNC_SEL(panel_config->disp_gpio_num);
         gpio_set_direction(panel_config->disp_gpio_num, GPIO_MODE_OUTPUT);
         esp_rom_gpio_pad_set_drv(panel_config->disp_gpio_num, 0);
         esp_rom_gpio_connect_out_signal(panel_config->disp_gpio_num, SIG_GPIO_OUT_IDX, false, false);
@@ -782,9 +824,12 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
 {
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 2)
     if (panel->bb_size) {
-        size_t num_dma_nodes_per_bounce_buffer = esp_dma_calculate_node_count(panel->bb_size, panel->sram_trans_align, LCD_DMA_DESCRIPTOR_BUFFER_MAX_SIZE);
+        size_t buffer_alignment = panel->sram_trans_align;
+        size_t num_dma_nodes_per_bounce_buffer = esp_dma_calculate_node_count(panel->bb_size, buffer_alignment, LCD_DMA_DESCRIPTOR_BUFFER_MAX_SIZE);
         gdma_link_list_config_t link_cfg = {
-            .buffer_alignment = panel->sram_trans_align,
+#if ESP_IDF_VERSION_MAJOR < 6
+            .buffer_alignment = buffer_alignment,
+#endif
             .item_alignment = LCD_GDMA_DESCRIPTOR_ALIGN,
             .num_items = num_dma_nodes_per_bounce_buffer * 2,
             .flags = {
@@ -796,14 +841,20 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
         gdma_buffer_mount_config_t mount_cfgs[2] = {0};
         for (int i = 0; i < 2; i++) {
             mount_cfgs[i].buffer = panel->bounce_buffer[i];
+#if ESP_IDF_VERSION_MAJOR >= 6
+            mount_cfgs[i].buffer_alignment = buffer_alignment;
+#endif
             mount_cfgs[i].length = panel->bb_size;
             mount_cfgs[i].flags.mark_eof = true;  // we use the DMA EOF interrupt to copy the frame buffer (partially) to the bounce buffer
         }
         ESP_RETURN_ON_ERROR(gdma_link_mount_buffers(panel->dma_bb_link, 0, mount_cfgs, 2, NULL), TAG, "mount DMA bounce buffers failed");
     } else {
-        size_t num_dma_nodes = esp_dma_calculate_node_count(panel->fb_size, panel->flags.fb_in_psram ? panel->psram_trans_align : panel->sram_trans_align, LCD_DMA_DESCRIPTOR_BUFFER_MAX_SIZE);
+        size_t buffer_alignment = panel->flags.fb_in_psram ? panel->psram_trans_align : panel->sram_trans_align;
+        size_t num_dma_nodes = esp_dma_calculate_node_count(panel->fb_size, buffer_alignment, LCD_DMA_DESCRIPTOR_BUFFER_MAX_SIZE);
         gdma_link_list_config_t link_cfg = {
-            .buffer_alignment = panel->flags.fb_in_psram ? panel->psram_trans_align : panel->sram_trans_align,
+#if ESP_IDF_VERSION_MAJOR < 6
+            .buffer_alignment = buffer_alignment,
+#endif
             .item_alignment = LCD_GDMA_DESCRIPTOR_ALIGN,
             .num_items = num_dma_nodes,
             .flags = {
@@ -812,6 +863,9 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
         };
         gdma_buffer_mount_config_t mount_cfg = {
             .length = panel->fb_size,
+#if ESP_IDF_VERSION_MAJOR >= 6
+            .buffer_alignment = buffer_alignment,
+#endif
             .flags = {
                 .mark_final = panel->flags.stream_mode ? false : true,
                 .mark_eof = true,
@@ -868,9 +922,13 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
     panel->dma_restart_node.dw0.size -= restart_skip_bytes;
 #endif
     // alloc DMA channel and connect to LCD peripheral
+#if ESP_IDF_VERSION_MAJOR >= 6
+    gdma_channel_alloc_config_t dma_chan_config = {};
+#else
     gdma_channel_alloc_config_t dma_chan_config = {
         .direction = GDMA_CHANNEL_DIRECTION_TX,
     };
+#endif
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
     ESP_RETURN_ON_ERROR(LCD_GDMA_NEW_CHANNEL(&dma_chan_config, &panel->dma_chan), TAG, "alloc DMA channel failed");
@@ -1015,7 +1073,7 @@ IRAM_ATTR static void lcd_default_isr_handler(void *args)
     }
 }
 
-#if ESP_IDF_VERSION_MAJOR == 5
+#if ESP_IDF_VERSION_MAJOR >= 5
 static esp_err_t lcd_rgb_panel_select_clock_src(esp_rgb_panel_t *panel, user_rgb_clock_source_t clk_src)
 {
     esp_err_t ret = ESP_OK;

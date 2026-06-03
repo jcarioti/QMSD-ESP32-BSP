@@ -6,9 +6,11 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
+#include "sdkconfig.h"
 #include "soc/soc_caps.h"
 #include "hal/dma_types.h"
-#if SOC_LCDCAM_SUPPORTED
+#if SOC_HAS(LCDCAM_I80_LCD) || SOC_HAS(LCDCAM_RGB_LCD)
 #include "hal/lcd_hal.h"
 #endif
 
@@ -26,7 +28,7 @@ extern "C" {
 
 #define LCD_DMA_DESCRIPTOR_BUFFER_MAX_SIZE 4095
 
-#if SOC_LCDCAM_SUPPORTED
+#if SOC_HAS(LCDCAM_I80_LCD) || SOC_HAS(LCDCAM_RGB_LCD)
 
 typedef enum {
     LCD_COM_DEVICE_TYPE_I80,
@@ -49,7 +51,7 @@ int lcd_com_register_device(lcd_com_device_type_t device_type, void *device_obj)
  * @param member_id member ID
  */
 void lcd_com_remove_device(lcd_com_device_type_t device_type, int member_id);
-#endif // SOC_LCDCAM_SUPPORTED
+#endif // SOC_HAS(LCDCAM_I80_LCD) || SOC_HAS(LCDCAM_RGB_LCD)
 
 /**
  * @brief Mount data to DMA descriptors
@@ -58,7 +60,23 @@ void lcd_com_remove_device(lcd_com_device_type_t device_type, int member_id);
  * @param buffer Data buffer
  * @param len Size of the data buffer, in bytes
  */
-void lcd_com_mount_dma_data(dma_descriptor_t *desc_head, const void *buffer, size_t len);
+static inline void lcd_com_mount_dma_data(dma_descriptor_t *desc_head, const void *buffer, size_t len)
+{
+    const uint8_t *buf = (const uint8_t *)buffer;
+    dma_descriptor_t *desc = desc_head;
+
+    while (len > 0 && desc) {
+        size_t desc_len = len > DMA_DESCRIPTOR_BUFFER_MAX_SIZE ? DMA_DESCRIPTOR_BUFFER_MAX_SIZE : len;
+        desc->dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+        desc->dw0.size = desc_len;
+        desc->dw0.length = desc_len;
+        desc->dw0.suc_eof = (len == desc_len);
+        desc->buffer = (void *)buf;
+        buf += desc_len;
+        len -= desc_len;
+        desc = desc->next;
+    }
+}
 
 /**
  * @brief Reverse the bytes in the buffer

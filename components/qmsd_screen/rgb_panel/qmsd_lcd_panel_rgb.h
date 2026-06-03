@@ -8,9 +8,15 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+#include "esp_idf_version.h"
+#include "esp_lcd_panel_rgb.h"
 #include "esp_lcd_types.h"
 #include "soc/soc_caps.h"
 #include "hal/lcd_types.h"
+
+#ifndef SOC_LCD_RGB_DATA_WIDTH
+#define SOC_LCD_RGB_DATA_WIDTH ESP_LCD_RGB_BUS_WIDTH_MAX
+#endif
 
 #ifdef __cplusplus
 extern "C" {

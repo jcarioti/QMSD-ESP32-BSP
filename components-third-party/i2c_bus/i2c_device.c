@@ -9,12 +9,19 @@ static i2c_port_obj_t *i2c_port_used[I2C_NUM_MAX] = { NULL };
 static i2c_port_obj_t i2c_port_temp;
 
 I2CDevice_t i2c_malloc_device(int i2c_num, int8_t sda, int8_t scl, uint32_t freq, uint8_t device_addr) {
-    if (i2c_num > I2C_NUM_MAX) {
-        i2c_num = I2C_NUM_MAX;
+    if (i2c_num < 0 || i2c_num >= I2C_NUM_MAX) {
+        i2c_log_e("Invalid i2c_num: %d (max: %d)", i2c_num, I2C_NUM_MAX - 1);
+        return NULL;
     }
 
-    for (uint8_t i = 0; i < I2C_NUM_MAX; i++) {
-        i2c_mutex[i] = I2C_MUTEX_CREATE();
+    // Important: do not recreate mutexes on each device allocation.
+    // Recreating overwrites the handle and breaks mutual exclusion across tasks/devices.
+    if (i2c_mutex[i2c_num] == NULL) {
+        i2c_mutex[i2c_num] = I2C_MUTEX_CREATE();
+        if (i2c_mutex[i2c_num] == NULL) {
+            i2c_log_e("Failed to create I2C mutex for port %d", i2c_num);
+            return NULL;
+        }
     }
 
     i2c_port_obj_t* new_device_port = (i2c_port_obj_t *)malloc(sizeof(i2c_port_obj_t));
@@ -31,6 +38,7 @@ I2CDevice_t i2c_malloc_device(int i2c_num, int8_t sda, int8_t scl, uint32_t freq
 
     i2c_device_t* device = (i2c_device_t *)malloc(sizeof(i2c_device_t));
     if (device == NULL) {
+        free(new_device_port);
         return NULL;
     }
 

@@ -18,6 +18,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_idf_version.h"
 #include "scr_interface_driver.h"
 #include "driver/gpio.h"
 
@@ -28,7 +29,7 @@ static const char *TAG = "screen interface";
         return (ret);                                                           \
     }
 
-#if (CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3)
+#if ESP_IDF_VERSION_MAJOR < 6 && (CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3)
 #define SOC_SUPPORT_8080_IFACE 1
 #endif
 
@@ -383,4 +384,3 @@ esp_err_t scr_interface_delete(const scr_interface_driver_t *driver)
     }
     return ESP_OK;
 }
-

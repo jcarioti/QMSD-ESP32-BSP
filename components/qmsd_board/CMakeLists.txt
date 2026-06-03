@@ -41,6 +41,10 @@ endif()
 
 set(requires driver esp_lcd bus screen qmsd_screen qmsd_touch qmsd_gui qmsd_button encoder_ab)
 
+if("${IDF_VERSION_MAJOR}" VERSION_GREATER_EQUAL "6")
+    list(APPEND requires esp_driver_gpio esp_driver_ledc)
+endif()
+
 idf_component_register(
     SRC_DIRS ${board_dir} board_utility 
     INCLUDE_DIRS ${board_dir} board_utility

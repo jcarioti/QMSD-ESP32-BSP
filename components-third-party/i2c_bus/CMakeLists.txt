@@ -2,13 +2,16 @@ set(requires driver)
 
 if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER_EQUAL "5.3")
     set(src_dirs i2c_hal_master)
-    set(priv_include_dirs ${IDF_PATH}/components/esp_driver_i2c)
+    list(APPEND requires esp_driver_i2c)
+    if("${IDF_VERSION_MAJOR}" VERSION_GREATER_EQUAL "6")
+        set(priv_include_dirs ${IDF_PATH}/components/esp_driver_i2c)
+        list(APPEND requires esp_ringbuf esp_pm)
+    endif()
 elseif("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER_EQUAL "5.2")
     set(src_dirs i2c_hal_master)
     set(priv_include_dirs ${IDF_PATH}/components/driver/i2c)
 else()
     set(src_dirs i2c_hal)
-    set(priv_include_dirs "")
 endif()
 
 

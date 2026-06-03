@@ -61,6 +61,10 @@ extern "C" {
 #define CONFIG_QMSD_GUI_FULL_REFRESH 0
 #endif
 
+#ifndef CONFIG_QMSD_GUI_DIRECT_MODE
+#define CONFIG_QMSD_GUI_DIRECT_MODE 0
+#endif
+
 #ifndef CONFIG_QMSD_BOARD_BACKLIGHT_DELAY
 #define CONFIG_QMSD_BOARD_BACKLIGHT_DELAY 250
 #endif
@@ -96,7 +100,7 @@ extern "C" {
             .double_fb = CONFIG_QMSD_GUI_DOUBLE_BUFFER, \
             .fb_in_psram = CONFIG_QMSD_GUI_BUFFER_IN_PSRAM, \
             .full_refresh = CONFIG_QMSD_GUI_FULL_REFRESH, \
-            .direct_mode = 0, \
+            .direct_mode = CONFIG_QMSD_GUI_DIRECT_MODE, \
             .antialiasing = 0, \
             .avoid_te = CONFIG_QMSD_GUI_AVOID_TE_EN, \
         } \

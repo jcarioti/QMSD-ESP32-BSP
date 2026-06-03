@@ -5,6 +5,10 @@
 
 #define QMSD_SCREEN_BK_FREQ     11111
 
+// Enable CONFIG_QMSD_SCREEN_20_MHZ_CLK for the vendor timing table. Disable it
+// to use the alternate 16 MHz timing table for panels that need more
+// conservative RGB timing.
+#ifdef CONFIG_QMSD_SCREEN_20_MHZ_CLK
 #define QMSD_RGB_CLK_FREQ           (20000000)
 #define QMSD_RGB_HSYNC_PULSE_WIDTH  (48)
 #define QMSD_RGB_HSYNC_BACK_PORCH   (40)
@@ -12,6 +16,15 @@
 #define QMSD_RGB_VSYNC_PULSE_WIDTH  (100)
 #define QMSD_RGB_VSYNC_BACK_PORCH   (48)
 #define QMSD_RGB_VSYNC_FRONT_PORCH  (8)
+#else
+#define QMSD_RGB_CLK_FREQ           (16000000)
+#define QMSD_RGB_HSYNC_PULSE_WIDTH  (10)
+#define QMSD_RGB_HSYNC_BACK_PORCH   (60)
+#define QMSD_RGB_HSYNC_FRONT_PORCH  (8)
+#define QMSD_RGB_VSYNC_PULSE_WIDTH  (10)
+#define QMSD_RGB_VSYNC_BACK_PORCH   (40)
+#define QMSD_RGB_VSYNC_FRONT_PORCH  (8)
+#endif
 
 #define QMSD_SCREEN_DIR_0       0
 #define QMSD_SCREEN_DIR_90      (QMSD_SCREEN_DIR_0 ^ SCR_MIRROR_X ^ SCR_SWAP_XY)

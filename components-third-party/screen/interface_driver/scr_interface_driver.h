@@ -20,7 +20,10 @@ extern "C" {
 #endif
 
 #include "esp_err.h"
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION_MAJOR < 6
 #include "i2s_lcd_driver.h"
+#endif
 #include "iic_bus.h"
 #include "spi_bus.h"
 

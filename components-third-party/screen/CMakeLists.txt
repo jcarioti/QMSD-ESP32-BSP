@@ -22,4 +22,5 @@ set(SCREEN_DIR "controller_driver/ili9341"
 idf_component_register(SRC_DIRS "${SCREEN_DIR}" "screen_utility" "interface_driver" "."
                         INCLUDE_DIRS "${SCREEN_DIR}" "interface_driver" "." "screen_utility"
                         REQUIRES bus
+                        PRIV_REQUIRES esp_driver_gpio
                         )
