@@ -85,6 +85,5 @@ static esp_err_t qmsd_screen_draw_pixel(uint16_t x, uint16_t y, uint16_t color) 
 
 static esp_err_t qmsd_screen_drawbitmap(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
     g_rgb_panel_handle->draw_bitmap(g_rgb_panel_handle, x, y, x + w, y + h, (void *)bitmap);
-    vTaskDelay(pdMS_TO_TICKS(2));
     return ESP_OK;
 }

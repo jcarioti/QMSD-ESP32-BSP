@@ -115,6 +115,10 @@
 
 static const char *TAG = "lcd_panel.rgb";
 
+#if !CONFIG_LCD_RGB_ISR_IRAM_SAFE
+void qmsd_gui_record_vsync(int64_t timestamp_us) __attribute__((weak));
+#endif
+
 typedef struct esp_rgb_panel_t esp_rgb_panel_t;
 
 static esp_err_t rgb_panel_del(esp_lcd_panel_t *panel);
@@ -1037,6 +1041,11 @@ IRAM_ATTR static void lcd_default_isr_handler(void *args)
     uint32_t intr_status = lcd_ll_get_interrupt_status(rgb_panel->hal.dev);
     lcd_ll_clear_interrupt_status(rgb_panel->hal.dev, intr_status);
     if (intr_status & LCD_LL_EVENT_VSYNC_END) {
+#if !CONFIG_LCD_RGB_ISR_IRAM_SAFE
+        if (qmsd_gui_record_vsync) {
+            qmsd_gui_record_vsync(esp_timer_get_time());
+        }
+#endif
         // call user registered callback
         if (rgb_panel->on_vsync) {
             if (rgb_panel->on_vsync(&rgb_panel->base, NULL, rgb_panel->user_ctx)) {
