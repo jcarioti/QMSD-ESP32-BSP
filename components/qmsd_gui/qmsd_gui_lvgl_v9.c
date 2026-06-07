@@ -24,11 +24,14 @@ static const char *TAG = "QMSD_GUI";
 static qmsd_gui_config_t* g_lvgl_config;
 static QueueHandle_t g_image_queue;
 static SemaphoreHandle_t g_gui_semaphore = NULL;
+static lv_display_t *s_lvgl_display = NULL;
 static TaskHandle_t s_gui_update_task_handle = NULL;
 static volatile bool s_render_stats_active = false;
+static bool s_direct_manual_refresh = false;
 static lv_area_t s_direct_flush_area;
 static bool s_direct_flush_area_valid = false;
 static uint32_t s_handler_flush_event_total_us = 0;
+static int64_t s_gui_update_vsync_consumed_us = 0;
 
 typedef struct {
     uint32_t count;
@@ -145,43 +148,50 @@ static void qmsd_gui_notify_vsync_from_isr(void)
 
 void qmsd_gui_record_vsync(int64_t timestamp_us)
 {
-    qmsd_gui_notify_vsync_from_isr();
-
-    if (!s_render_stats_active || timestamp_us <= 0) {
+    if (timestamp_us <= 0) {
+        qmsd_gui_notify_vsync_from_isr();
         return;
     }
 
     portENTER_CRITICAL_ISR(&s_vsync_stats_mux);
 
-    if (s_vsync_stats.last_us > 0 && timestamp_us > s_vsync_stats.last_us) {
-        uint32_t interval_us = (uint32_t)(timestamp_us - s_vsync_stats.last_us);
-        s_vsync_stats.interval_count++;
-        s_vsync_stats.interval_total_us += interval_us;
-        if (s_vsync_stats.interval_min_us == 0 ||
-            interval_us < s_vsync_stats.interval_min_us) {
-            s_vsync_stats.interval_min_us = interval_us;
-        }
-        if (interval_us > s_vsync_stats.interval_max_us) {
-            s_vsync_stats.interval_max_us = interval_us;
-        }
+    int64_t previous_vsync_us = s_vsync_stats.last_us;
+    uint32_t previous_interval_us = s_vsync_stats.last_interval_us;
+    s_vsync_stats.last_us = timestamp_us;
 
-        if (s_vsync_stats.last_interval_us > 0) {
-            uint32_t jitter_us = interval_us > s_vsync_stats.last_interval_us
-                                     ? interval_us - s_vsync_stats.last_interval_us
-                                     : s_vsync_stats.last_interval_us - interval_us;
-            s_vsync_stats.jitter_count++;
-            s_vsync_stats.jitter_total_us += jitter_us;
-            if (jitter_us > s_vsync_stats.jitter_max_us) {
-                s_vsync_stats.jitter_max_us = jitter_us;
+    if (s_render_stats_active) {
+        if (previous_vsync_us > 0 && timestamp_us > previous_vsync_us) {
+            uint32_t interval_us = (uint32_t)(timestamp_us - previous_vsync_us);
+            s_vsync_stats.interval_count++;
+            s_vsync_stats.interval_total_us += interval_us;
+            if (s_vsync_stats.interval_min_us == 0 ||
+                interval_us < s_vsync_stats.interval_min_us) {
+                s_vsync_stats.interval_min_us = interval_us;
             }
+            if (interval_us > s_vsync_stats.interval_max_us) {
+                s_vsync_stats.interval_max_us = interval_us;
+            }
+
+            if (previous_interval_us > 0) {
+                uint32_t jitter_us = interval_us > previous_interval_us
+                                         ? interval_us - previous_interval_us
+                                         : previous_interval_us - interval_us;
+                s_vsync_stats.jitter_count++;
+                s_vsync_stats.jitter_total_us += jitter_us;
+                if (jitter_us > s_vsync_stats.jitter_max_us) {
+                    s_vsync_stats.jitter_max_us = jitter_us;
+                }
+            }
+            s_vsync_stats.last_interval_us = interval_us;
         }
-        s_vsync_stats.last_interval_us = interval_us;
+        s_vsync_stats.count++;
+    } else {
+        s_vsync_stats.last_interval_us = 0;
     }
 
-    s_vsync_stats.last_us = timestamp_us;
-    s_vsync_stats.count++;
-
     portEXIT_CRITICAL_ISR(&s_vsync_stats_mux);
+
+    qmsd_gui_notify_vsync_from_isr();
 }
 
 static void qmsd_gui_vsync_stats_snapshot_and_reset(qmsd_gui_vsync_stats_t *snapshot)
@@ -823,6 +833,11 @@ static bool qmsd_gui_direct_mode_phase_sync_enabled(void)
     return g_lvgl_config && g_lvgl_config->flags.direct_mode;
 }
 
+static bool qmsd_gui_direct_manual_refresh_enabled(void)
+{
+    return s_direct_manual_refresh && s_lvgl_display;
+}
+
 static bool qmsd_gui_wait_for_direct_render_vsync(void)
 {
     if (!qmsd_gui_direct_mode_phase_sync_enabled()) {
@@ -832,16 +847,26 @@ static bool qmsd_gui_wait_for_direct_render_vsync(void)
     int64_t now_us = esp_timer_get_time();
     int64_t last_vsync_us = qmsd_gui_last_vsync_us();
     if (last_vsync_us > 0 &&
+        last_vsync_us != s_gui_update_vsync_consumed_us &&
         now_us >= last_vsync_us &&
         (now_us - last_vsync_us) <= QMSD_GUI_DIRECT_RENDER_PHASE_WINDOW_US) {
         (void)ulTaskNotifyTake(pdTRUE, 0);
+        s_gui_update_vsync_consumed_us = last_vsync_us;
         return true;
     }
 
     /* Drop stale VSYNC notifications from work that completed after the last scan edge. */
     (void)ulTaskNotifyTake(pdTRUE, 0);
-    return ulTaskNotifyTake(pdTRUE,
-                            pdMS_TO_TICKS(QMSD_GUI_DIRECT_RENDER_VSYNC_WAIT_TIMEOUT_MS)) > 0;
+    if (ulTaskNotifyTake(pdTRUE,
+                         pdMS_TO_TICKS(QMSD_GUI_DIRECT_RENDER_VSYNC_WAIT_TIMEOUT_MS)) <= 0) {
+        return false;
+    }
+
+    last_vsync_us = qmsd_gui_last_vsync_us();
+    if (last_vsync_us > 0) {
+        s_gui_update_vsync_consumed_us = last_vsync_us;
+    }
+    return true;
 }
 
 static void gui_update_task(void* arg) {
@@ -856,6 +881,9 @@ static void gui_update_task(void* arg) {
             lock_taken = true;
             lock_acquired_us = esp_timer_get_time();
             s_handler_flush_event_total_us = 0;
+            if (qmsd_gui_direct_manual_refresh_enabled()) {
+                lv_display_refr_timer(NULL);
+            }
             lv_timer_handler();
             lvgl_done_us = esp_timer_get_time();
             qmsd_gui_unlock();
@@ -924,6 +952,12 @@ void qmsd_gui_init(qmsd_gui_config_t* lvgl_config) {
     }
 
     lv_display_set_default(display);
+    s_lvgl_display = display;
+    if (lvgl_config->flags.direct_mode) {
+        lv_display_delete_refr_timer(display);
+        s_direct_manual_refresh = true;
+        ESP_LOGI(TAG, "direct-mode display refresh timer decoupled from lv_timer_handler");
+    }
 
     if (lvgl_config->touch_read) {
         lv_indev_t *indev = lv_indev_create();
