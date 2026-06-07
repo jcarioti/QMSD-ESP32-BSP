@@ -31,6 +31,10 @@ static bool s_direct_manual_refresh = false;
 static lv_area_t s_direct_flush_area;
 static bool s_direct_flush_area_valid = false;
 static uint32_t s_handler_flush_event_total_us = 0;
+static uint32_t s_handler_flush_wait_total_us = 0;
+static uint32_t s_handler_refr_cycles = 0;
+static uint32_t s_handler_render_cycles = 0;
+static uint32_t s_handler_flushes = 0;
 static int64_t s_gui_update_vsync_consumed_us = 0;
 
 typedef struct {
@@ -66,6 +70,12 @@ typedef struct {
     uint32_t lvgl_work_max_us;
     uint32_t lvgl_work_slow_16ms;
     uint32_t lvgl_work_slow_25ms;
+    uint32_t handler_refresh_max;
+    uint32_t handler_render_max;
+    uint32_t handler_flush_max;
+    uint32_t handler_flush_event_max_us;
+    uint32_t handler_flush_wait_max_us;
+    uint32_t handler_phase_synced;
     uint32_t flush_calls;
     uint64_t flush_total_us;
     uint64_t flush_pixels;
@@ -447,6 +457,7 @@ static void qmsd_gui_display_event_cb(lv_event_t *event)
         s_render_stats.refr_start_us = now_us;
         break;
     case LV_EVENT_REFR_READY:
+        s_handler_refr_cycles++;
         qmsd_gui_render_stats_record_elapsed(&s_render_stats.refr_cycles,
                                              &s_render_stats.refr_total_us,
                                              &s_render_stats.refr_max_us,
@@ -467,6 +478,7 @@ static void qmsd_gui_display_event_cb(lv_event_t *event)
                                                  s_render_stats.render_start_vsync_us);
         break;
     case LV_EVENT_RENDER_READY:
+        s_handler_render_cycles++;
         qmsd_gui_render_stats_finish_render_work(now_us);
         qmsd_gui_render_stats_record_elapsed(&s_render_stats.render_cycles,
                                              &s_render_stats.render_total_us,
@@ -492,6 +504,7 @@ static void qmsd_gui_display_event_cb(lv_event_t *event)
                                                  s_render_stats.flush_event_start_vsync_us);
         break;
     case LV_EVENT_FLUSH_FINISH:
+        s_handler_flushes++;
         if (s_render_stats.flush_event_start_us > 0 &&
             s_render_stats.flush_event_start_vsync_us > 0 &&
             qmsd_gui_last_vsync_us() > s_render_stats.flush_event_start_vsync_us) {
@@ -510,6 +523,9 @@ static void qmsd_gui_display_event_cb(lv_event_t *event)
         s_render_stats.flush_wait_start_us = now_us;
         break;
     case LV_EVENT_FLUSH_WAIT_FINISH:
+        if (s_render_stats.flush_wait_start_us > 0 && now_us >= s_render_stats.flush_wait_start_us) {
+            s_handler_flush_wait_total_us += (uint32_t)(now_us - s_render_stats.flush_wait_start_us);
+        }
         qmsd_gui_render_stats_record_elapsed(&s_render_stats.flush_waits,
                                              &s_render_stats.flush_wait_total_us,
                                              &s_render_stats.flush_wait_max_us,
@@ -526,6 +542,11 @@ static void qmsd_gui_render_stats_record_handler(uint32_t elapsed_us,
                                                  uint32_t lock_wait_us,
                                                  uint32_t lvgl_handler_us,
                                                  uint32_t flush_event_us,
+                                                 uint32_t flush_wait_us,
+                                                 uint32_t handler_refresh_cycles,
+                                                 uint32_t handler_render_cycles,
+                                                 uint32_t handler_flushes,
+                                                 bool phase_synced,
                                                  bool lock_taken)
 {
     if (!qmsd_gui_render_stats_enabled()) {
@@ -575,6 +596,25 @@ static void qmsd_gui_render_stats_record_handler(uint32_t elapsed_us,
         }
         if (lvgl_work_us >= QMSD_GUI_VERY_SLOW_HANDLER_US) {
             s_render_stats.lvgl_work_slow_25ms++;
+        }
+
+        if (handler_refresh_cycles > s_render_stats.handler_refresh_max) {
+            s_render_stats.handler_refresh_max = handler_refresh_cycles;
+        }
+        if (handler_render_cycles > s_render_stats.handler_render_max) {
+            s_render_stats.handler_render_max = handler_render_cycles;
+        }
+        if (handler_flushes > s_render_stats.handler_flush_max) {
+            s_render_stats.handler_flush_max = handler_flushes;
+        }
+        if (flush_event_us > s_render_stats.handler_flush_event_max_us) {
+            s_render_stats.handler_flush_event_max_us = flush_event_us;
+        }
+        if (flush_wait_us > s_render_stats.handler_flush_wait_max_us) {
+            s_render_stats.handler_flush_wait_max_us = flush_wait_us;
+        }
+        if (phase_synced) {
+            s_render_stats.handler_phase_synced++;
         }
     }
 
@@ -632,7 +672,7 @@ static void qmsd_gui_render_stats_record_handler(uint32_t elapsed_us,
                                        ? (uint32_t)(vsync.jitter_total_us / vsync.jitter_count)
                                        : 0;
     ESP_LOGI(TAG,
-             "render handlers=%lu avg_us=%lu max_us=%lu slow16=%lu slow25=%lu lock_avg_us=%lu lock_max_us=%lu lvgl_avg_us=%lu lvgl_max_us=%lu lvgl_work_avg_us=%lu lvgl_work_max_us=%lu slow_work16=%lu slow_work25=%lu refresh=%lu fps=%lu.%01lu refresh_avg_us=%lu refresh_max_us=%lu "
+             "render handlers=%lu avg_us=%lu max_us=%lu slow16=%lu slow25=%lu lock_avg_us=%lu lock_max_us=%lu lvgl_avg_us=%lu lvgl_max_us=%lu lvgl_work_avg_us=%lu lvgl_work_max_us=%lu slow_work16=%lu slow_work25=%lu handler_refresh_max=%lu handler_render_max=%lu handler_flush_max=%lu handler_flush_event_max_us=%lu handler_flush_wait_max_us=%lu phase_sync=%lu refresh=%lu fps=%lu.%01lu refresh_avg_us=%lu refresh_max_us=%lu "
              "render=%lu render_avg_us=%lu render_max_us=%lu render_vsync_avg_us=%lu render_vsync_min_us=%lu render_vsync_max_us=%lu render_cross_vsync=%lu render_work=%lu render_work_avg_us=%lu render_work_max_us=%lu render_work_cross_vsync=%lu "
              "flushes=%lu flush_full=%lu flush_kpx=%llu flush_avg_us=%lu flush_max_us=%lu flush_max_px=%lu flush_max_area=%ld,%ld,%ld,%ld flush_vsync_avg_us=%lu flush_vsync_min_us=%lu flush_vsync_max_us=%lu flush_cross_vsync=%lu "
              "wait=%lu wait_avg_us=%lu wait_max_us=%lu vsync=%lu vsync_avg_us=%lu vsync_min_us=%lu vsync_max_us=%lu jitter_avg_us=%lu jitter_max_us=%lu "
@@ -650,6 +690,12 @@ static void qmsd_gui_render_stats_record_handler(uint32_t elapsed_us,
              (unsigned long)s_render_stats.lvgl_work_max_us,
              (unsigned long)s_render_stats.lvgl_work_slow_16ms,
              (unsigned long)s_render_stats.lvgl_work_slow_25ms,
+             (unsigned long)s_render_stats.handler_refresh_max,
+             (unsigned long)s_render_stats.handler_render_max,
+             (unsigned long)s_render_stats.handler_flush_max,
+             (unsigned long)s_render_stats.handler_flush_event_max_us,
+             (unsigned long)s_render_stats.handler_flush_wait_max_us,
+             (unsigned long)s_render_stats.handler_phase_synced,
              (unsigned long)s_render_stats.refr_cycles,
              (unsigned long)(refr_fps_x10 / 10),
              (unsigned long)(refr_fps_x10 % 10),
@@ -879,6 +925,10 @@ static void gui_update_task(void* arg) {
         bool phase_synced = false;
 
         s_handler_flush_event_total_us = 0;
+        s_handler_flush_wait_total_us = 0;
+        s_handler_refr_cycles = 0;
+        s_handler_render_cycles = 0;
+        s_handler_flushes = 0;
 
         if (qmsd_gui_direct_manual_refresh_enabled()) {
             int64_t timer_lock_start_us = esp_timer_get_time();
@@ -921,11 +971,24 @@ static void gui_update_task(void* arg) {
         uint32_t handler_wall_us = (uint32_t)(esp_timer_get_time() - handler_start_us);
         uint32_t handler_end = lock_taken ? (lock_wait_us + lvgl_handler_us) : handler_wall_us;
         uint32_t flush_event_us = lock_taken ? s_handler_flush_event_total_us : 0;
+        uint32_t flush_wait_us = lock_taken ? s_handler_flush_wait_total_us : 0;
+        uint32_t handler_refresh_cycles = lock_taken ? s_handler_refr_cycles : 0;
+        uint32_t handler_render_cycles = lock_taken ? s_handler_render_cycles : 0;
+        uint32_t handler_flushes = lock_taken ? s_handler_flushes : 0;
         s_handler_flush_event_total_us = 0;
+        s_handler_flush_wait_total_us = 0;
+        s_handler_refr_cycles = 0;
+        s_handler_render_cycles = 0;
+        s_handler_flushes = 0;
         qmsd_gui_render_stats_record_handler(handler_end,
                                              lock_taken ? lock_wait_us : handler_end,
                                              lvgl_handler_us,
                                              flush_event_us,
+                                             flush_wait_us,
+                                             handler_refresh_cycles,
+                                             handler_render_cycles,
+                                             handler_flushes,
+                                             phase_synced,
                                              lock_taken);
         if (phase_synced) {
             vTaskDelay(pdMS_TO_TICKS(1));
