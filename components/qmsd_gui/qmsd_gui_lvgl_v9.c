@@ -68,6 +68,8 @@ typedef struct {
     uint64_t flush_pixels;
     uint32_t flush_max_us;
     uint32_t flush_max_pixels;
+    lv_area_t flush_max_area;
+    bool flush_max_area_valid;
     uint32_t flush_full_calls;
     uint32_t refr_cycles;
     uint64_t refr_total_us;
@@ -107,8 +109,12 @@ typedef struct {
     uint32_t inv_full_calls;
     uint32_t inv_pending_calls;
     uint64_t inv_pending_pixels;
+    lv_area_t inv_pending_area;
+    bool inv_pending_area_valid;
     uint32_t inv_pending_peak_calls;
     uint32_t inv_pending_peak_kpx;
+    lv_area_t inv_pending_peak_area;
+    bool inv_pending_peak_area_valid;
     uint32_t inv_pressure_windows;
     bool inv_pressure_seen;
     int64_t window_start_us;
@@ -206,7 +212,27 @@ static int64_t qmsd_gui_last_vsync_us(void)
     return last_us;
 }
 
-static void qmsd_gui_render_stats_record_flush(uint32_t pixels, uint32_t elapsed_us)
+static void qmsd_gui_area_union_into(lv_area_t *dst, bool *valid, const lv_area_t *area)
+{
+    if (!dst || !valid || !area) {
+        return;
+    }
+
+    if (!*valid) {
+        *dst = *area;
+        *valid = true;
+        return;
+    }
+
+    if (area->x1 < dst->x1) dst->x1 = area->x1;
+    if (area->y1 < dst->y1) dst->y1 = area->y1;
+    if (area->x2 > dst->x2) dst->x2 = area->x2;
+    if (area->y2 > dst->y2) dst->y2 = area->y2;
+}
+
+static void qmsd_gui_render_stats_record_flush(const lv_area_t *area,
+                                               uint32_t pixels,
+                                               uint32_t elapsed_us)
 {
     s_render_stats.flush_calls++;
     s_render_stats.flush_total_us += elapsed_us;
@@ -216,6 +242,10 @@ static void qmsd_gui_render_stats_record_flush(uint32_t pixels, uint32_t elapsed
     }
     if (pixels > s_render_stats.flush_max_pixels) {
         s_render_stats.flush_max_pixels = pixels;
+        if (area) {
+            s_render_stats.flush_max_area = *area;
+            s_render_stats.flush_max_area_valid = true;
+        }
     }
     uint32_t display_pixels = 0;
     if (g_lvgl_config && g_lvgl_config->width && g_lvgl_config->hight) {
@@ -356,12 +386,22 @@ static void qmsd_gui_render_stats_record_invalidation(lv_display_t *display, con
 
     s_render_stats.inv_pending_calls++;
     s_render_stats.inv_pending_pixels += pixels;
+    qmsd_gui_area_union_into(&s_render_stats.inv_pending_area,
+                             &s_render_stats.inv_pending_area_valid,
+                             area);
+    bool pending_peak = false;
     if (s_render_stats.inv_pending_calls > s_render_stats.inv_pending_peak_calls) {
         s_render_stats.inv_pending_peak_calls = s_render_stats.inv_pending_calls;
+        pending_peak = true;
     }
     uint32_t pending_kpx = (uint32_t)(s_render_stats.inv_pending_pixels / 1000ULL);
     if (pending_kpx > s_render_stats.inv_pending_peak_kpx) {
         s_render_stats.inv_pending_peak_kpx = pending_kpx;
+        pending_peak = true;
+    }
+    if (pending_peak && s_render_stats.inv_pending_area_valid) {
+        s_render_stats.inv_pending_peak_area = s_render_stats.inv_pending_area;
+        s_render_stats.inv_pending_peak_area_valid = true;
     }
     if (!s_render_stats.inv_pressure_seen &&
         s_render_stats.inv_pending_calls > QMSD_GUI_INV_PRESSURE_AREAS) {
@@ -374,6 +414,8 @@ static void qmsd_gui_render_stats_reset_pending_invalidations(void)
 {
     s_render_stats.inv_pending_calls = 0;
     s_render_stats.inv_pending_pixels = 0;
+    memset(&s_render_stats.inv_pending_area, 0, sizeof(s_render_stats.inv_pending_area));
+    s_render_stats.inv_pending_area_valid = false;
     s_render_stats.inv_pressure_seen = false;
 }
 
@@ -582,9 +624,9 @@ static void qmsd_gui_render_stats_record_handler(uint32_t elapsed_us,
     ESP_LOGI(TAG,
              "render handlers=%lu avg_us=%lu max_us=%lu slow16=%lu slow25=%lu lock_avg_us=%lu lock_max_us=%lu lvgl_avg_us=%lu lvgl_max_us=%lu lvgl_work_avg_us=%lu lvgl_work_max_us=%lu slow_work16=%lu slow_work25=%lu refresh=%lu fps=%lu.%01lu refresh_avg_us=%lu refresh_max_us=%lu "
              "render=%lu render_avg_us=%lu render_max_us=%lu render_vsync_avg_us=%lu render_vsync_min_us=%lu render_vsync_max_us=%lu render_cross_vsync=%lu render_work=%lu render_work_avg_us=%lu render_work_max_us=%lu render_work_cross_vsync=%lu "
-             "flushes=%lu flush_full=%lu flush_kpx=%llu flush_avg_us=%lu flush_max_us=%lu flush_max_px=%lu flush_vsync_avg_us=%lu flush_vsync_min_us=%lu flush_vsync_max_us=%lu flush_cross_vsync=%lu "
+             "flushes=%lu flush_full=%lu flush_kpx=%llu flush_avg_us=%lu flush_max_us=%lu flush_max_px=%lu flush_max_area=%ld,%ld,%ld,%ld flush_vsync_avg_us=%lu flush_vsync_min_us=%lu flush_vsync_max_us=%lu flush_cross_vsync=%lu "
              "wait=%lu wait_avg_us=%lu wait_max_us=%lu vsync=%lu vsync_avg_us=%lu vsync_min_us=%lu vsync_max_us=%lu jitter_avg_us=%lu jitter_max_us=%lu "
-             "inv=%lu inv_kpx=%llu inv_max_px=%lu inv_max_area=%ld,%ld,%ld,%ld inv_full=%lu inv_pending_peak=%lu inv_pending_peak_kpx=%lu inv_over32_windows=%lu",
+             "inv=%lu inv_kpx=%llu inv_max_px=%lu inv_max_area=%ld,%ld,%ld,%ld inv_full=%lu inv_pending_peak=%lu inv_pending_peak_kpx=%lu inv_pending_peak_area=%ld,%ld,%ld,%ld inv_over32_windows=%lu",
              (unsigned long)s_render_stats.handler_calls,
              (unsigned long)handler_avg_us,
              (unsigned long)s_render_stats.handler_max_us,
@@ -620,6 +662,10 @@ static void qmsd_gui_render_stats_record_handler(uint32_t elapsed_us,
              (unsigned long)flush_avg_us,
              (unsigned long)s_render_stats.flush_max_us,
              (unsigned long)s_render_stats.flush_max_pixels,
+             (long)s_render_stats.flush_max_area.x1,
+             (long)s_render_stats.flush_max_area.y1,
+             (long)s_render_stats.flush_max_area.x2,
+             (long)s_render_stats.flush_max_area.y2,
              (unsigned long)flush_since_vsync_avg_us,
              (unsigned long)s_render_stats.flush_since_vsync_min_us,
              (unsigned long)s_render_stats.flush_since_vsync_max_us,
@@ -643,6 +689,10 @@ static void qmsd_gui_render_stats_record_handler(uint32_t elapsed_us,
              (unsigned long)s_render_stats.inv_full_calls,
              (unsigned long)s_render_stats.inv_pending_peak_calls,
              (unsigned long)s_render_stats.inv_pending_peak_kpx,
+             (long)s_render_stats.inv_pending_peak_area.x1,
+             (long)s_render_stats.inv_pending_peak_area.y1,
+             (long)s_render_stats.inv_pending_peak_area.x2,
+             (long)s_render_stats.inv_pending_peak_area.y2,
              (unsigned long)s_render_stats.inv_pressure_windows);
 
     memset(&s_render_stats, 0, sizeof(s_render_stats));
@@ -667,11 +717,18 @@ static void refresh_task(void* arg) {
             int w = show_data->offsetx2 - show_data->offsetx1 + 1;
             int offsety1 = show_data->offsety1;
             int h = show_data->offsety2 - show_data->offsety1 + 1;
+            lv_area_t flush_area = {
+                .x1 = show_data->offsetx1,
+                .y1 = show_data->offsety1,
+                .x2 = show_data->offsetx2,
+                .y2 = show_data->offsety2,
+            };
             bool stats_enabled = qmsd_gui_render_stats_enabled();
             int64_t flush_start_us = stats_enabled ? esp_timer_get_time() : 0;
             g_lvgl_config->draw_bitmap(offsetx1, offsety1, w, h, (uint16_t*)show_data->color);
             if (stats_enabled) {
-                qmsd_gui_render_stats_record_flush((uint32_t)(w * h),
+                qmsd_gui_render_stats_record_flush(&flush_area,
+                                                   (uint32_t)(w * h),
                                                    (uint32_t)(esp_timer_get_time() - flush_start_us));
             }
             xQueueReceive(g_image_queue, &show_data, 0);
@@ -718,7 +775,8 @@ static void lvgl_flush(lv_display_t* display, const lv_area_t* area, uint8_t* co
     int64_t flush_start_us = stats_enabled ? esp_timer_get_time() : 0;
     g_lvgl_config->draw_bitmap(area->x1, area->y1, w, h, (uint16_t*)color_map);
     if (stats_enabled) {
-        qmsd_gui_render_stats_record_flush((uint32_t)w * (uint32_t)h,
+        qmsd_gui_render_stats_record_flush(area,
+                                           (uint32_t)w * (uint32_t)h,
                                            (uint32_t)(esp_timer_get_time() - flush_start_us));
     }
     qmsd_gui_direct_flush_area_reset();
