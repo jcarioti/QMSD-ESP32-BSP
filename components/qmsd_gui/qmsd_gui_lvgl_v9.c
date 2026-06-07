@@ -872,30 +872,58 @@ static bool qmsd_gui_wait_for_direct_render_vsync(void)
 static void gui_update_task(void* arg) {
     s_gui_update_task_handle = xTaskGetCurrentTaskHandle();
     while (1) {
-        bool phase_synced = qmsd_gui_wait_for_direct_render_vsync();
         int64_t handler_start_us = esp_timer_get_time();
-        int64_t lock_acquired_us = 0;
-        int64_t lvgl_done_us = handler_start_us;
+        uint32_t lock_wait_us = 0;
+        uint32_t lvgl_handler_us = 0;
         bool lock_taken = false;
-        if (qmsd_gui_lock(portMAX_DELAY) == 0) {
-            lock_taken = true;
-            lock_acquired_us = esp_timer_get_time();
-            s_handler_flush_event_total_us = 0;
-            if (qmsd_gui_direct_manual_refresh_enabled()) {
-                lv_display_refr_timer(NULL);
+        bool phase_synced = false;
+
+        s_handler_flush_event_total_us = 0;
+
+        if (qmsd_gui_direct_manual_refresh_enabled()) {
+            int64_t timer_lock_start_us = esp_timer_get_time();
+            if (qmsd_gui_lock(portMAX_DELAY) == 0) {
+                lock_taken = true;
+                int64_t timer_lock_acquired_us = esp_timer_get_time();
+                lock_wait_us += (uint32_t)(timer_lock_acquired_us - timer_lock_start_us);
+                lv_timer_handler();
+                int64_t timer_done_us = esp_timer_get_time();
+                lvgl_handler_us += (uint32_t)(timer_done_us - timer_lock_acquired_us);
+                qmsd_gui_unlock();
             }
-            lv_timer_handler();
-            lvgl_done_us = esp_timer_get_time();
-            qmsd_gui_unlock();
+
+            phase_synced = qmsd_gui_wait_for_direct_render_vsync();
+
+            int64_t refresh_lock_start_us = esp_timer_get_time();
+            if (qmsd_gui_lock(portMAX_DELAY) == 0) {
+                lock_taken = true;
+                int64_t refresh_lock_acquired_us = esp_timer_get_time();
+                lock_wait_us += (uint32_t)(refresh_lock_acquired_us - refresh_lock_start_us);
+                lv_display_refr_timer(NULL);
+                int64_t refresh_done_us = esp_timer_get_time();
+                lvgl_handler_us += (uint32_t)(refresh_done_us - refresh_lock_acquired_us);
+                qmsd_gui_unlock();
+            }
+        } else {
+            int64_t lock_acquired_us = 0;
+            int64_t lvgl_done_us = handler_start_us;
+            if (qmsd_gui_lock(portMAX_DELAY) == 0) {
+                lock_taken = true;
+                lock_acquired_us = esp_timer_get_time();
+                lv_timer_handler();
+                lvgl_done_us = esp_timer_get_time();
+                qmsd_gui_unlock();
+            }
+            lock_wait_us = lock_taken ? (uint32_t)(lock_acquired_us - handler_start_us) : 0;
+            lvgl_handler_us = lock_taken ? (uint32_t)(lvgl_done_us - lock_acquired_us) : 0;
         }
 
-        uint32_t handler_end = (uint32_t)(esp_timer_get_time() - handler_start_us);
-        uint32_t lock_wait_us = lock_taken ? (uint32_t)(lock_acquired_us - handler_start_us) : handler_end;
-        uint32_t lvgl_handler_us = lock_taken ? (uint32_t)(lvgl_done_us - lock_acquired_us) : 0;
+        uint32_t handler_wall_us = (uint32_t)(esp_timer_get_time() - handler_start_us);
+        uint32_t handler_end = lock_taken ? (lock_wait_us + lvgl_handler_us) : handler_wall_us;
         uint32_t flush_event_us = lock_taken ? s_handler_flush_event_total_us : 0;
         s_handler_flush_event_total_us = 0;
         qmsd_gui_render_stats_record_handler(handler_end,
-                                             lock_wait_us,
+                                             lock_taken ? lock_wait_us : handler_end,
                                              lvgl_handler_us,
                                              flush_event_us,
                                              lock_taken);
