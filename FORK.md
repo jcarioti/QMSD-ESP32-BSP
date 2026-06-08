@@ -9,6 +9,9 @@ Reconciled upstream commit: `d452ad7` (`fixed: rgb driver bug`).
   changes for configurable RGB panel timing, RGB transfer stability,
   GUI task/touch handling, optional UI performance tracing, draw-bitmap error
   reporting, and removal of unused vendor examples/audio assets.
+- The RGB/LVGL render pacing path is intentionally independent of log level.
+  `QMSD_GUI_RENDER_TELEMETRY_ENABLED` defaults to `0`; enable it only for debug
+  builds that need aggregate `QMSD_GUI` / `lcd_panel.rgb` timing logs.
 - `Port BSP for ESP-IDF 6` contains the generic ESP-IDF 6 compatibility port.
 
 Keep changes BSP-scoped so the fork remains usable outside any single firmware

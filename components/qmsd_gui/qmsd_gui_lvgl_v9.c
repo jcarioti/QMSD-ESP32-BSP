@@ -10,6 +10,10 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifndef QMSD_GUI_RENDER_TELEMETRY_ENABLED
+#define QMSD_GUI_RENDER_TELEMETRY_ENABLED 0
+#endif
+
 // Forward declare to avoid adding a build-time dependency edge from qmsd_gui -> qmsd_touch.
 uint32_t touch_samples_waiting(void);
 void qmsd_lcd_rgb_panel_phase_stats_log(void) __attribute__((weak));
@@ -67,6 +71,18 @@ static int64_t s_gui_update_vsync_consumed_us = 0;
 static bool qmsd_gui_direct_render_slice_fence(void);
 
 typedef struct {
+    uint32_t inv_pending_calls;
+    uint64_t inv_pending_pixels;
+    lv_area_t inv_pending_area;
+    bool inv_pending_area_valid;
+    bool render_active;
+    int64_t flush_event_start_us;
+} qmsd_gui_direct_render_state_t;
+
+static qmsd_gui_direct_render_state_t s_direct_render_state;
+
+#if QMSD_GUI_RENDER_TELEMETRY_ENABLED
+typedef struct {
     int64_t start_us;
     lv_timer_cb_t cb;
 } qmsd_gui_lvgl_timer_trace_frame_t;
@@ -74,6 +90,7 @@ typedef struct {
 static qmsd_gui_lvgl_timer_trace_frame_t
     s_lvgl_timer_trace_stack[QMSD_GUI_TIMER_TRACE_STACK_DEPTH];
 static uint8_t s_lvgl_timer_trace_depth = 0;
+#endif
 
 typedef struct {
     uint32_t count;
@@ -290,14 +307,23 @@ typedef struct {
 
 static bool qmsd_gui_render_stats_enabled(void)
 {
+#if QMSD_GUI_RENDER_TELEMETRY_ENABLED
     bool enabled = esp_log_level_get(TAG) >= ESP_LOG_INFO;
     s_render_stats_active = enabled;
     return enabled;
+#else
+    s_render_stats_active = false;
+    return false;
+#endif
 }
 
 void qmsd_gui_lvgl_timer_exec_trace_begin(lv_timer_t *timer, lv_timer_cb_t cb)
 {
     (void)timer;
+#if !QMSD_GUI_RENDER_TELEMETRY_ENABLED
+    (void)cb;
+    return;
+#else
     if (!s_render_stats_active || !cb) {
         return;
     }
@@ -310,11 +336,16 @@ void qmsd_gui_lvgl_timer_exec_trace_begin(lv_timer_t *timer, lv_timer_cb_t cb)
             .start_us = esp_timer_get_time(),
             .cb = cb,
         };
+#endif
 }
 
 void qmsd_gui_lvgl_timer_exec_trace_end(lv_timer_t *timer, lv_timer_cb_t cb)
 {
     (void)timer;
+#if !QMSD_GUI_RENDER_TELEMETRY_ENABLED
+    (void)cb;
+    return;
+#else
     if (!s_render_stats_active || s_lvgl_timer_trace_depth == 0) {
         return;
     }
@@ -339,6 +370,7 @@ void qmsd_gui_lvgl_timer_exec_trace_end(lv_timer_t *timer, lv_timer_cb_t cb)
     if (elapsed_us >= QMSD_GUI_VERY_SLOW_HANDLER_US) {
         s_render_stats.lvgl_timer_cb_slow_25ms++;
     }
+#endif
 }
 
 static void qmsd_gui_render_stats_log_task(void *arg)
@@ -466,6 +498,9 @@ static void qmsd_gui_render_stats_log_task(void *arg)
 
 static void qmsd_gui_render_stats_log_task_start(void)
 {
+#if !QMSD_GUI_RENDER_TELEMETRY_ENABLED
+    return;
+#endif
     if (s_render_stats_log_task_handle || s_render_stats_log_queue) {
         return;
     }
@@ -827,20 +862,39 @@ static void qmsd_gui_render_stats_record_invalidation(lv_display_t *display, con
     }
 }
 
+static void qmsd_gui_direct_render_record_invalidation(const lv_area_t *area)
+{
+    uint32_t pixels = qmsd_gui_area_pixels(area);
+
+    s_direct_render_state.inv_pending_calls++;
+    s_direct_render_state.inv_pending_pixels += pixels;
+    qmsd_gui_area_union_into(&s_direct_render_state.inv_pending_area,
+                             &s_direct_render_state.inv_pending_area_valid,
+                             area);
+}
+
 static bool qmsd_gui_direct_render_slice_fence_needed(void)
 {
-    if (s_render_stats.inv_pending_calls >= QMSD_GUI_DIRECT_RENDER_SLICE_FENCE_INV_AREAS) {
+    if (s_direct_render_state.inv_pending_calls >= QMSD_GUI_DIRECT_RENDER_SLICE_FENCE_INV_AREAS) {
         return true;
     }
-    if (s_render_stats.inv_pending_pixels >= QMSD_GUI_DIRECT_RENDER_SLICE_FENCE_INV_PIXELS) {
+    if (s_direct_render_state.inv_pending_pixels >= QMSD_GUI_DIRECT_RENDER_SLICE_FENCE_INV_PIXELS) {
         return true;
     }
-    if (s_render_stats.inv_pending_area_valid &&
-        qmsd_gui_area_pixels(&s_render_stats.inv_pending_area) >=
+    if (s_direct_render_state.inv_pending_area_valid &&
+        qmsd_gui_area_pixels(&s_direct_render_state.inv_pending_area) >=
             QMSD_GUI_DIRECT_RENDER_SLICE_FENCE_UNION_PIXELS) {
         return true;
     }
     return false;
+}
+
+static void qmsd_gui_direct_render_reset_pending_invalidations(void)
+{
+    s_direct_render_state.inv_pending_calls = 0;
+    s_direct_render_state.inv_pending_pixels = 0;
+    memset(&s_direct_render_state.inv_pending_area, 0, sizeof(s_direct_render_state.inv_pending_area));
+    s_direct_render_state.inv_pending_area_valid = false;
 }
 
 static void qmsd_gui_render_stats_reset_pending_invalidations(void)
@@ -854,98 +908,130 @@ static void qmsd_gui_render_stats_reset_pending_invalidations(void)
 
 static void qmsd_gui_display_event_cb(lv_event_t *event)
 {
-    if (!qmsd_gui_render_stats_enabled()) {
-        return;
-    }
-
     lv_event_code_t code = lv_event_get_code(event);
-    int64_t now_us = esp_timer_get_time();
+    int64_t now_us = -1;
+    bool stats_enabled = qmsd_gui_render_stats_enabled();
+#define QMSD_GUI_DISPLAY_EVENT_NOW_US() \
+    ((now_us >= 0) ? now_us : (now_us = esp_timer_get_time()))
 
     switch (code) {
     case LV_EVENT_INVALIDATE_AREA:
-        qmsd_gui_render_stats_record_invalidation((lv_display_t *)lv_event_get_target(event),
-                                                  lv_event_get_invalidated_area(event));
+        qmsd_gui_direct_render_record_invalidation(lv_event_get_invalidated_area(event));
+        if (stats_enabled) {
+            qmsd_gui_render_stats_record_invalidation((lv_display_t *)lv_event_get_target(event),
+                                                      lv_event_get_invalidated_area(event));
+        }
         break;
     case LV_EVENT_REFR_START:
-        s_render_stats.refr_start_us = now_us;
+        if (stats_enabled) {
+            s_render_stats.refr_start_us = QMSD_GUI_DISPLAY_EVENT_NOW_US();
+        }
         break;
     case LV_EVENT_REFR_READY:
-        s_handler_refr_cycles++;
-        qmsd_gui_render_stats_record_elapsed(&s_render_stats.refr_cycles,
-                                             &s_render_stats.refr_total_us,
-                                             &s_render_stats.refr_max_us,
-                                             s_render_stats.refr_start_us,
-                                             now_us);
-        s_render_stats.refr_start_us = 0;
-        qmsd_gui_render_stats_reset_pending_invalidations();
+        if (stats_enabled) {
+            int64_t event_now_us = QMSD_GUI_DISPLAY_EVENT_NOW_US();
+            s_handler_refr_cycles++;
+            qmsd_gui_render_stats_record_elapsed(&s_render_stats.refr_cycles,
+                                                 &s_render_stats.refr_total_us,
+                                                 &s_render_stats.refr_max_us,
+                                                 s_render_stats.refr_start_us,
+                                                 event_now_us);
+            s_render_stats.refr_start_us = 0;
+            qmsd_gui_render_stats_reset_pending_invalidations();
+        }
+        qmsd_gui_direct_render_reset_pending_invalidations();
         break;
     case LV_EVENT_RENDER_START:
-        s_render_stats.render_start_us = now_us;
-        s_render_stats.render_start_vsync_us = qmsd_gui_last_vsync_us();
-        s_render_stats.render_slice_fenced = false;
-        qmsd_gui_render_stats_start_render_work(now_us);
-        qmsd_gui_render_stats_record_since_vsync(&s_render_stats.render_since_vsync_count,
-                                                 &s_render_stats.render_since_vsync_total_us,
-                                                 &s_render_stats.render_since_vsync_min_us,
-                                                 &s_render_stats.render_since_vsync_max_us,
-                                                 now_us,
-                                                 s_render_stats.render_start_vsync_us);
+        s_direct_render_state.render_active = true;
+        if (stats_enabled) {
+            int64_t event_now_us = QMSD_GUI_DISPLAY_EVENT_NOW_US();
+            s_render_stats.render_start_us = event_now_us;
+            s_render_stats.render_start_vsync_us = qmsd_gui_last_vsync_us();
+            s_render_stats.render_slice_fenced = false;
+            qmsd_gui_render_stats_start_render_work(event_now_us);
+            qmsd_gui_render_stats_record_since_vsync(&s_render_stats.render_since_vsync_count,
+                                                     &s_render_stats.render_since_vsync_total_us,
+                                                     &s_render_stats.render_since_vsync_min_us,
+                                                     &s_render_stats.render_since_vsync_max_us,
+                                                     event_now_us,
+                                                     s_render_stats.render_start_vsync_us);
+        }
         break;
     case LV_EVENT_RENDER_READY:
-        s_handler_render_cycles++;
-        qmsd_gui_render_stats_finish_render_work(now_us);
-        qmsd_gui_render_stats_record_elapsed(&s_render_stats.render_cycles,
-                                             &s_render_stats.render_total_us,
-                                             &s_render_stats.render_max_us,
-                                             s_render_stats.render_start_us,
-                                             now_us);
-        if (s_render_stats.render_start_vsync_us > 0 &&
-            qmsd_gui_last_vsync_us() > s_render_stats.render_start_vsync_us) {
-            s_render_stats.render_cross_vsync++;
-            if (s_render_stats.render_slice_fenced) {
-                s_render_stats.render_fenced_cross_vsync++;
-            } else {
-                s_render_stats.render_unfenced_cross_vsync++;
+        if (stats_enabled) {
+            int64_t event_now_us = QMSD_GUI_DISPLAY_EVENT_NOW_US();
+            s_handler_render_cycles++;
+            qmsd_gui_render_stats_finish_render_work(event_now_us);
+            qmsd_gui_render_stats_record_elapsed(&s_render_stats.render_cycles,
+                                                 &s_render_stats.render_total_us,
+                                                 &s_render_stats.render_max_us,
+                                                 s_render_stats.render_start_us,
+                                                 event_now_us);
+            if (s_render_stats.render_start_vsync_us > 0 &&
+                qmsd_gui_last_vsync_us() > s_render_stats.render_start_vsync_us) {
+                s_render_stats.render_cross_vsync++;
+                if (s_render_stats.render_slice_fenced) {
+                    s_render_stats.render_fenced_cross_vsync++;
+                } else {
+                    s_render_stats.render_unfenced_cross_vsync++;
+                }
             }
+            s_render_stats.render_start_us = 0;
+            s_render_stats.render_start_vsync_us = 0;
+            s_render_stats.render_slice_fenced = false;
         }
-        s_render_stats.render_start_us = 0;
-        s_render_stats.render_start_vsync_us = 0;
-        s_render_stats.render_slice_fenced = false;
+        s_direct_render_state.render_active = false;
         break;
     case LV_EVENT_FLUSH_START:
-        qmsd_gui_render_stats_finish_render_work(now_us);
-        s_render_stats.flush_event_start_us = now_us;
-        s_render_stats.flush_event_start_vsync_us = qmsd_gui_last_vsync_us();
-        qmsd_gui_render_stats_record_since_vsync(&s_render_stats.flush_since_vsync_count,
-                                                 &s_render_stats.flush_since_vsync_total_us,
-                                                 &s_render_stats.flush_since_vsync_min_us,
-                                                 &s_render_stats.flush_since_vsync_max_us,
-                                                 now_us,
-                                                 s_render_stats.flush_event_start_vsync_us);
+        s_direct_render_state.flush_event_start_us = QMSD_GUI_DISPLAY_EVENT_NOW_US();
+        if (stats_enabled) {
+            int64_t event_now_us = QMSD_GUI_DISPLAY_EVENT_NOW_US();
+            qmsd_gui_render_stats_finish_render_work(event_now_us);
+            s_render_stats.flush_event_start_us = event_now_us;
+            s_render_stats.flush_event_start_vsync_us = qmsd_gui_last_vsync_us();
+            qmsd_gui_render_stats_record_since_vsync(&s_render_stats.flush_since_vsync_count,
+                                                     &s_render_stats.flush_since_vsync_total_us,
+                                                     &s_render_stats.flush_since_vsync_min_us,
+                                                     &s_render_stats.flush_since_vsync_max_us,
+                                                     event_now_us,
+                                                     s_render_stats.flush_event_start_vsync_us);
+        }
         break;
-    case LV_EVENT_FLUSH_FINISH:
-        s_handler_flushes++;
+    case LV_EVENT_FLUSH_FINISH: {
         uint32_t flush_event_elapsed_us = 0;
-        if (s_render_stats.flush_event_start_us > 0 &&
-            s_render_stats.flush_event_start_vsync_us > 0 &&
-            qmsd_gui_last_vsync_us() > s_render_stats.flush_event_start_vsync_us) {
-            s_render_stats.flush_cross_vsync++;
-            qmsd_gui_render_stats_note_flush_cross(now_us);
+        if (s_direct_render_state.flush_event_start_us > 0 &&
+            QMSD_GUI_DISPLAY_EVENT_NOW_US() >= s_direct_render_state.flush_event_start_us) {
+            flush_event_elapsed_us =
+                (uint32_t)(QMSD_GUI_DISPLAY_EVENT_NOW_US() - s_direct_render_state.flush_event_start_us);
         }
-        if (s_render_stats.flush_event_start_us > 0 && now_us >= s_render_stats.flush_event_start_us) {
-            flush_event_elapsed_us = (uint32_t)(now_us - s_render_stats.flush_event_start_us);
+        s_direct_render_state.flush_event_start_us = 0;
+        if (stats_enabled) {
+            s_handler_flushes++;
+            if (s_render_stats.flush_event_start_us > 0 &&
+                s_render_stats.flush_event_start_vsync_us > 0 &&
+                qmsd_gui_last_vsync_us() > s_render_stats.flush_event_start_vsync_us) {
+                s_render_stats.flush_cross_vsync++;
+                qmsd_gui_render_stats_note_flush_cross(QMSD_GUI_DISPLAY_EVENT_NOW_US());
+            }
+            if (s_render_stats.flush_event_start_us > 0 &&
+                QMSD_GUI_DISPLAY_EVENT_NOW_US() >= s_render_stats.flush_event_start_us) {
+                flush_event_elapsed_us =
+                    (uint32_t)(QMSD_GUI_DISPLAY_EVENT_NOW_US() - s_render_stats.flush_event_start_us);
+            }
             s_handler_flush_event_total_us += flush_event_elapsed_us;
+            s_render_stats.flush_event_start_us = 0;
+            s_render_stats.flush_event_start_vsync_us = 0;
         }
-        s_render_stats.flush_event_start_us = 0;
-        s_render_stats.flush_event_start_vsync_us = 0;
-        if (s_render_stats.render_start_us > 0) {
+        if (s_direct_render_state.render_active) {
             if (!s_handler_last_flush_was_last &&
                 (qmsd_gui_direct_render_slice_fence_needed() ||
                  flush_event_elapsed_us >= QMSD_GUI_DIRECT_RENDER_SLICE_FENCE_FLUSH_US)) {
                 int64_t slice_wait_start_us = esp_timer_get_time();
                 if (qmsd_gui_direct_render_slice_fence()) {
                     uint32_t slice_wait_us = (uint32_t)(esp_timer_get_time() - slice_wait_start_us);
-                    s_render_stats.render_slice_fenced = true;
+                    if (stats_enabled) {
+                        s_render_stats.render_slice_fenced = true;
+                    }
                     s_handler_render_slice_waits++;
                     s_handler_render_slice_wait_total_us += slice_wait_us;
                     if (slice_wait_us > s_handler_render_slice_wait_max_us) {
@@ -954,26 +1040,35 @@ static void qmsd_gui_display_event_cb(lv_event_t *event)
                     now_us = esp_timer_get_time();
                 }
             }
-            qmsd_gui_render_stats_start_render_work(now_us);
+            if (stats_enabled) {
+                qmsd_gui_render_stats_start_render_work(QMSD_GUI_DISPLAY_EVENT_NOW_US());
+            }
         }
         break;
+    }
     case LV_EVENT_FLUSH_WAIT_START:
-        s_render_stats.flush_wait_start_us = now_us;
+        if (stats_enabled) {
+            s_render_stats.flush_wait_start_us = QMSD_GUI_DISPLAY_EVENT_NOW_US();
+        }
         break;
     case LV_EVENT_FLUSH_WAIT_FINISH:
-        if (s_render_stats.flush_wait_start_us > 0 && now_us >= s_render_stats.flush_wait_start_us) {
-            s_handler_flush_wait_total_us += (uint32_t)(now_us - s_render_stats.flush_wait_start_us);
+        if (stats_enabled) {
+            int64_t event_now_us = QMSD_GUI_DISPLAY_EVENT_NOW_US();
+            if (s_render_stats.flush_wait_start_us > 0 && event_now_us >= s_render_stats.flush_wait_start_us) {
+                s_handler_flush_wait_total_us += (uint32_t)(event_now_us - s_render_stats.flush_wait_start_us);
+            }
+            qmsd_gui_render_stats_record_elapsed(&s_render_stats.flush_waits,
+                                                 &s_render_stats.flush_wait_total_us,
+                                                 &s_render_stats.flush_wait_max_us,
+                                                 s_render_stats.flush_wait_start_us,
+                                                 event_now_us);
+            s_render_stats.flush_wait_start_us = 0;
         }
-        qmsd_gui_render_stats_record_elapsed(&s_render_stats.flush_waits,
-                                             &s_render_stats.flush_wait_total_us,
-                                             &s_render_stats.flush_wait_max_us,
-                                             s_render_stats.flush_wait_start_us,
-                                             now_us);
-        s_render_stats.flush_wait_start_us = 0;
         break;
     default:
         break;
     }
+#undef QMSD_GUI_DISPLAY_EVENT_NOW_US
 }
 
 static void qmsd_gui_render_stats_record_handler(uint32_t elapsed_us,
@@ -1427,8 +1522,8 @@ static void qmsd_gui_delay_until_near_us(int64_t target_us)
 static bool qmsd_gui_direct_render_pressure(uint32_t timer_handler_us)
 {
     return timer_handler_us >= QMSD_GUI_DIRECT_RENDER_PRESSURE_TIMER_US ||
-           s_render_stats.inv_pending_calls >= QMSD_GUI_DIRECT_RENDER_PRESSURE_INV_AREAS ||
-           s_render_stats.inv_pending_pixels >= QMSD_GUI_DIRECT_RENDER_PRESSURE_INV_PIXELS;
+           s_direct_render_state.inv_pending_calls >= QMSD_GUI_DIRECT_RENDER_PRESSURE_INV_AREAS ||
+           s_direct_render_state.inv_pending_pixels >= QMSD_GUI_DIRECT_RENDER_PRESSURE_INV_PIXELS;
 }
 
 static bool qmsd_gui_wait_for_direct_render_vsync(bool pressure)

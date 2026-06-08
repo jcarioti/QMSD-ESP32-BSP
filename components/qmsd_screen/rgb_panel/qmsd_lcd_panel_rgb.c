@@ -16,6 +16,10 @@
 
 #if SOC_LCD_RGB_SUPPORTED
 
+#ifndef QMSD_GUI_RENDER_TELEMETRY_ENABLED
+#define QMSD_GUI_RENDER_TELEMETRY_ENABLED 0
+#endif
+
 #if CONFIG_LCD_ENABLE_DEBUG_LOG
 // The local log level must be defined before including esp_log.h
 // Set the maximum log level for this source file
@@ -240,6 +244,7 @@ struct esp_rgb_panel_t {
 #endif
 };
 
+#if QMSD_GUI_RENDER_TELEMETRY_ENABLED
 static esp_rgb_panel_t *s_phase_monitor_panel = NULL;
 
 static IRAM_ATTR uint32_t lcd_rgb_panel_phase_distance_px(uint32_t a, uint32_t b, uint32_t frame_px)
@@ -578,6 +583,55 @@ void qmsd_lcd_rgb_panel_phase_stats_log(void)
                  (unsigned long)phase_swap_wait_wrap_cross);
     }
 }
+#else
+static inline void lcd_rgb_panel_phase_init(esp_rgb_panel_t *panel)
+{
+    (void)panel;
+}
+
+static inline IRAM_ATTR void lcd_rgb_panel_phase_record_eof(esp_rgb_panel_t *panel,
+                                                            int before_pos_px,
+                                                            int after_pos_px)
+{
+    (void)panel;
+    (void)before_pos_px;
+    (void)after_pos_px;
+}
+
+static inline IRAM_ATTR void lcd_rgb_panel_phase_record_start(esp_rgb_panel_t *panel)
+{
+    (void)panel;
+}
+
+static inline void lcd_rgb_panel_phase_record_swap_wait(esp_rgb_panel_t *panel,
+                                                        int64_t start_us,
+                                                        uint32_t start_vsync,
+                                                        uint32_t start_wrap,
+                                                        BaseType_t result)
+{
+    (void)panel;
+    (void)start_us;
+    (void)start_vsync;
+    (void)start_wrap;
+    (void)result;
+}
+
+#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+static inline IRAM_ATTR void lcd_rgb_panel_phase_record_restart(esp_rgb_panel_t *panel)
+{
+    (void)panel;
+}
+#endif
+
+static inline IRAM_ATTR void lcd_rgb_panel_phase_record_vsync(esp_rgb_panel_t *panel)
+{
+    (void)panel;
+}
+
+void qmsd_lcd_rgb_panel_phase_stats_log(void)
+{
+}
+#endif
 
 static esp_err_t lcd_rgb_panel_alloc_frame_buffers(const qmsd_lcd_rgb_panel_config_t *rgb_panel_config, esp_rgb_panel_t *rgb_panel)
 {
@@ -778,9 +832,11 @@ esp_err_t qmsd_lcd_new_rgb_panel(const qmsd_lcd_rgb_panel_config_t *rgb_panel_co
     rgb_panel->flags.avoid_te = rgb_panel_config->flags.avoid_te;
     rgb_panel->spinlock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
     lcd_rgb_panel_phase_init(rgb_panel);
+#if QMSD_GUI_RENDER_TELEMETRY_ENABLED
     if (rgb_panel->bb_size) {
         s_phase_monitor_panel = rgb_panel;
     }
+#endif
     // fill function table
     rgb_panel->base.del = rgb_panel_del;
     rgb_panel->base.reset = rgb_panel_reset;
@@ -972,6 +1028,7 @@ static esp_err_t rgb_panel_draw_bitmap(esp_lcd_panel_t *panel, int x_start, int 
 
         if (rgb_panel->flags.avoid_te) {
             xSemaphoreTake(rgb_panel->swap_ready, 0);
+#if QMSD_GUI_RENDER_TELEMETRY_ENABLED
             uint32_t wait_start_vsync = rgb_panel->phase.vsync_total;
             uint32_t wait_start_wrap = rgb_panel->phase.frame_wrap_total;
             int64_t wait_start_us = esp_timer_get_time();
@@ -981,6 +1038,9 @@ static esp_err_t rgb_panel_draw_bitmap(esp_lcd_panel_t *panel, int x_start, int 
                                                  wait_start_vsync,
                                                  wait_start_wrap,
                                                  wait_result);
+#else
+            xSemaphoreTake(rgb_panel->swap_ready, portMAX_DELAY);
+#endif
         }
 
         return ESP_OK;
