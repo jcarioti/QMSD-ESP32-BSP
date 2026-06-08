@@ -237,6 +237,9 @@ struct esp_rgb_panel_t {
     uint8_t bb_eof_count;
     gdma_link_list_handle_t dma_bb_link; // DMA link list for bounce buffer
     gdma_link_list_handle_t dma_fb_links[RGB_LCD_PANEL_MAX_FB_NUM]; // DMA link lists for multiple frame buffers
+#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+    gdma_link_list_handle_t dma_restart_link; // DMA link list used to restart the transfer
+#endif
 #else
     dma_descriptor_t *dma_links[2];    // fbs[0] <-> dma_links[0], fbs[1] <-> dma_links[1]
     dma_descriptor_t dma_restart_node; // DMA descriptor used to restart the transfer
@@ -703,6 +706,21 @@ static esp_err_t lcd_rgb_panel_destory(esp_rgb_panel_t *rgb_panel)
         gdma_disconnect(rgb_panel->dma_chan);
         gdma_del_channel(rgb_panel->dma_chan);
     }
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 2)
+    for (size_t i = 0; i < RGB_LCD_PANEL_MAX_FB_NUM; i++) {
+        if (rgb_panel->dma_fb_links[i]) {
+            gdma_del_link_list(rgb_panel->dma_fb_links[i]);
+        }
+    }
+    if (rgb_panel->dma_bb_link) {
+        gdma_del_link_list(rgb_panel->dma_bb_link);
+    }
+#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+    if (rgb_panel->dma_restart_link) {
+        gdma_del_link_list(rgb_panel->dma_restart_link);
+    }
+#endif
+#endif
     if (rgb_panel->intr) {
         esp_intr_free(rgb_panel->intr);
     }
@@ -774,6 +792,7 @@ esp_err_t qmsd_lcd_new_rgb_panel(const qmsd_lcd_rgb_panel_config_t *rgb_panel_co
 #endif
     rgb_panel->fb_size = fb_size;
     rgb_panel->bb_size = bb_size;
+    rgb_panel->bits_per_pixel = bits_per_pixel;
     rgb_panel->panel_id = -1;
     // register to platform
     int panel_id = lcd_com_register_device(LCD_COM_DEVICE_TYPE_RGB, rgb_panel);
@@ -824,7 +843,6 @@ esp_err_t qmsd_lcd_new_rgb_panel(const qmsd_lcd_rgb_panel_config_t *rgb_panel_co
     memcpy(rgb_panel->data_gpio_nums, rgb_panel_config->data_gpio_nums, sizeof(rgb_panel->data_gpio_nums));
     rgb_panel->timings = rgb_panel_config->timings;
     rgb_panel->data_width = rgb_panel_config->data_width;
-    rgb_panel->bits_per_pixel = bits_per_pixel;
     rgb_panel->disp_gpio_num = rgb_panel_config->disp_gpio_num;
     rgb_panel->flags.disp_en_level = !rgb_panel_config->flags.disp_active_low;
     rgb_panel->flags.no_fb = rgb_panel_config->flags.no_fb;
@@ -1291,6 +1309,10 @@ static IRAM_ATTR bool lcd_rgb_panel_eof_handler(gdma_channel_handle_t dma_chan, 
 static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
 {
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 2)
+#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+    size_t bytes_per_pixel = panel->bits_per_pixel / 8;
+    size_t restart_skip_bytes = LCD_FIFO_PRESERVE_SIZE_PX * bytes_per_pixel;
+#endif
     if (panel->bb_size) {
         size_t buffer_alignment = panel->sram_trans_align;
         size_t num_dma_nodes_per_bounce_buffer = esp_dma_calculate_node_count(panel->bb_size, buffer_alignment, LCD_DMA_DESCRIPTOR_BUFFER_MAX_SIZE);
@@ -1316,6 +1338,34 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
             mount_cfgs[i].flags.mark_eof = true;  // we use the DMA EOF interrupt to copy the frame buffer (partially) to the bounce buffer
         }
         ESP_RETURN_ON_ERROR(gdma_link_mount_buffers(panel->dma_bb_link, 0, mount_cfgs, 2, NULL), TAG, "mount DMA bounce buffers failed");
+#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+        // Match the actual first mounted node; IDF 6 shortens node lengths for buffer alignment.
+        size_t restart_length = gdma_link_get_length(panel->dma_bb_link, 0);
+        ESP_RETURN_ON_FALSE(restart_skip_bytes < restart_length, ESP_ERR_INVALID_ARG, TAG, "restart skip is too large for bounce buffer");
+        gdma_link_list_config_t restart_link_cfg = {
+#if ESP_IDF_VERSION_MAJOR < 6
+            .buffer_alignment = buffer_alignment,
+#endif
+            .item_alignment = LCD_GDMA_DESCRIPTOR_ALIGN,
+            .num_items = 1,
+            .flags = {
+                .check_owner = true,
+            },
+        };
+        ESP_RETURN_ON_ERROR(gdma_new_link_list(&restart_link_cfg, &panel->dma_restart_link), TAG, "create DMA restart link failed");
+        gdma_buffer_mount_config_t restart_mount_cfg = {
+            .buffer = panel->bounce_buffer[0] + restart_skip_bytes,
+            .length = restart_length - restart_skip_bytes,
+#if ESP_IDF_VERSION_MAJOR >= 6
+            .buffer_alignment = buffer_alignment,
+#endif
+            .flags = {
+                .bypass_buffer_align_check = true,
+            },
+        };
+        ESP_RETURN_ON_ERROR(gdma_link_mount_buffers(panel->dma_restart_link, 0, &restart_mount_cfg, 1, NULL), TAG, "mount DMA restart buffer failed");
+        gdma_link_concat(panel->dma_restart_link, 0, panel->dma_bb_link, 1);
+#endif
     } else {
         size_t buffer_alignment = panel->flags.fb_in_psram ? panel->psram_trans_align : panel->sram_trans_align;
         size_t num_dma_nodes = esp_dma_calculate_node_count(panel->fb_size, buffer_alignment, LCD_DMA_DESCRIPTOR_BUFFER_MAX_SIZE);
@@ -1345,6 +1395,34 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
             mount_cfg.buffer = panel->fbs[i];
             ESP_RETURN_ON_ERROR(gdma_link_mount_buffers(panel->dma_fb_links[i], 0, &mount_cfg, 1, NULL), TAG, "mount DMA frame buffer failed");
         }
+#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+        // Match the actual first mounted node; IDF 6 shortens node lengths for buffer alignment.
+        size_t restart_length = gdma_link_get_length(panel->dma_fb_links[0], 0);
+        ESP_RETURN_ON_FALSE(restart_skip_bytes < restart_length, ESP_ERR_INVALID_ARG, TAG, "restart skip is too large for frame buffer");
+        gdma_link_list_config_t restart_link_cfg = {
+#if ESP_IDF_VERSION_MAJOR < 6
+            .buffer_alignment = buffer_alignment,
+#endif
+            .item_alignment = LCD_GDMA_DESCRIPTOR_ALIGN,
+            .num_items = 1,
+            .flags = {
+                .check_owner = true,
+            },
+        };
+        ESP_RETURN_ON_ERROR(gdma_new_link_list(&restart_link_cfg, &panel->dma_restart_link), TAG, "create DMA restart link failed");
+        gdma_buffer_mount_config_t restart_mount_cfg = {
+            .buffer = panel->fbs[0] + restart_skip_bytes,
+            .length = restart_length - restart_skip_bytes,
+#if ESP_IDF_VERSION_MAJOR >= 6
+            .buffer_alignment = buffer_alignment,
+#endif
+            .flags = {
+                .bypass_buffer_align_check = true,
+            },
+        };
+        ESP_RETURN_ON_ERROR(gdma_link_mount_buffers(panel->dma_restart_link, 0, &restart_mount_cfg, 1, NULL), TAG, "mount DMA restart buffer failed");
+        gdma_link_concat(panel->dma_restart_link, 0, panel->dma_fb_links[0], 1);
+#endif
     }
 
 #else
@@ -1379,11 +1457,11 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
         }
     }
 #endif
-#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+#if CONFIG_LCD_RGB_RESTART_IN_VSYNC && (ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 3, 2))
     // On restart, the data sent to the LCD peripheral needs to start LCD_FIFO_PRESERVE_SIZE_PX pixels after the FB start
     // so we use a dedicated DMA node to restart the DMA transaction
     memcpy(&panel->dma_restart_node, &panel->dma_nodes[0], sizeof(panel->dma_restart_node));
-    int restart_skip_bytes = LCD_FIFO_PRESERVE_SIZE_PX * sizeof(uint16_t);
+    int restart_skip_bytes = LCD_FIFO_PRESERVE_SIZE_PX * (panel->bits_per_pixel / 8);
     uint8_t *p = (uint8_t *)panel->dma_restart_node.buffer;
     panel->dma_restart_node.buffer = &p[restart_skip_bytes];
     panel->dma_restart_node.dw0.length -= restart_skip_bytes;
@@ -1434,25 +1512,32 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
 static IRAM_ATTR void lcd_rgb_panel_restart_transmission_in_isr(esp_rgb_panel_t *panel)
 {
     lcd_rgb_panel_phase_record_restart(panel);
+    int bytes_per_pixel = panel->bits_per_pixel / 8;
+    int bb_size_px = bytes_per_pixel > 0 ? panel->bb_size / bytes_per_pixel : 0;
     if (panel->bb_size) {
         // Catch de-synced frame buffer and reset if needed.
-        if (panel->bounce_pos_px > panel->bb_size) {
+        if (panel->bounce_pos_px > bb_size_px * 2) {
             panel->bounce_pos_px = 0;
         }
         // Pre-fill bounce buffer 0, if the EOF ISR didn't do that already
-        if (panel->bounce_pos_px < panel->bb_size / 2) {
+        if (panel->bounce_pos_px < bb_size_px) {
             lcd_rgb_panel_fill_bounce_buffer(panel, panel->bounce_buffer[0]);
         }
     }
 
+    lcd_ll_fifo_reset(panel->hal.dev);
     gdma_reset(panel->dma_chan);
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 2)
+    gdma_start(panel->dma_chan, gdma_link_get_head_addr(panel->dma_restart_link));
+#else
     // restart the DMA by a special DMA node
     gdma_start(panel->dma_chan, (intptr_t)&panel->dma_restart_node);
+#endif
 
     if (panel->bb_size) {
         // Fill 2nd bounce buffer while 1st is being sent out, if needed.
-        if (panel->bounce_pos_px < panel->bb_size) {
-            lcd_rgb_panel_fill_bounce_buffer(panel, panel->bounce_buffer[0]);
+        if (panel->bounce_pos_px < bb_size_px * 2) {
+            lcd_rgb_panel_fill_bounce_buffer(panel, panel->bounce_buffer[1]);
         }
     }
 }

@@ -13,7 +13,12 @@
 // limitations under the License.
 #ifndef _I2C_BUS_H_
 #define _I2C_BUS_H_
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION_MAJOR >= 6
+#include "driver/i2c_types_legacy.h"
+#else
 #include "driver/i2c.h"
+#endif
 
 #define NULL_I2C_MEM_ADDR 0xFF /*!< set mem_address to NULL_I2C_MEM_ADDR if i2c device has no internal address during read/write */
 #define NULL_I2C_DEV_ADDR 0xFF /*!< invalid i2c device address */

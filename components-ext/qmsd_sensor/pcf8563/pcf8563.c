@@ -1,6 +1,6 @@
 #include "pcf8563.h"
 #include "i2c_device.h"
-#include "driver/i2c.h"
+#include "hal/i2c_types.h"
 
 #include <string.h>
 
