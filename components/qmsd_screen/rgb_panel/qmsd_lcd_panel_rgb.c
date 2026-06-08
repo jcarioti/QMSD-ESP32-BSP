@@ -112,6 +112,8 @@
 #define LCD_RGB_INTR_ALLOC_FLAGS     ESP_INTR_FLAG_INTRDISABLED
 #endif
 #define RGB_LCD_PANEL_MAX_FB_NUM         3 // maximum supported frame buffer number
+#define LCD_RGB_PHASE_BASELINE_SAMPLES   16
+#define LCD_RGB_PHASE_BASELINE_POSITIONS 4
 
 static const char *TAG = "lcd_panel.rgb";
 
@@ -120,6 +122,41 @@ void qmsd_gui_record_vsync(int64_t timestamp_us) __attribute__((weak));
 #endif
 
 typedef struct esp_rgb_panel_t esp_rgb_panel_t;
+
+typedef struct {
+    uint32_t frame_px;
+    uint32_t chunk_px;
+    uint32_t vsync_total;
+    uint32_t eof_total;
+    uint32_t frame_wrap_total;
+    uint32_t start_total;
+    uint32_t restart_total;
+    uint32_t eof_since_vsync;
+    uint32_t wraps_since_vsync;
+    uint32_t last_pos_px;
+    uint32_t last_delta_px;
+    uint32_t max_delta_px;
+    uint32_t last_eofs_since_vsync;
+    uint32_t min_eofs_since_vsync;
+    uint32_t max_eofs_since_vsync;
+    uint32_t last_wraps_since_vsync;
+    uint32_t anomalies;
+    uint32_t eof_anomalies;
+    uint32_t baseline_resets;
+    uint32_t baseline_overflow;
+    uint32_t baseline_eof_min;
+    uint32_t baseline_eof_max;
+    uint32_t swap_wait_calls;
+    uint32_t swap_wait_total_us;
+    uint32_t swap_wait_max_us;
+    uint32_t swap_wait_vsync_cross;
+    uint32_t swap_wait_wrap_cross;
+    uint32_t swap_wait_timeout;
+    uint32_t baseline_pos_px[LCD_RGB_PHASE_BASELINE_POSITIONS];
+    uint8_t baseline_pos_count;
+    uint8_t baseline_samples;
+    bool baseline_valid;
+} lcd_rgb_phase_monitor_t;
 
 static esp_err_t rgb_panel_del(esp_lcd_panel_t *panel);
 static esp_err_t rgb_panel_reset(esp_lcd_panel_t *panel);
@@ -138,6 +175,18 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel);
 static esp_err_t lcd_rgb_panel_configure_gpio(esp_rgb_panel_t *panel, const qmsd_lcd_rgb_panel_config_t *panel_config);
 static void lcd_rgb_panel_start_transmission(esp_rgb_panel_t *rgb_panel);
 static void lcd_default_isr_handler(void *args);
+static void lcd_rgb_panel_phase_init(esp_rgb_panel_t *panel);
+static void lcd_rgb_panel_phase_record_eof(esp_rgb_panel_t *panel, int before_pos_px, int after_pos_px);
+static void lcd_rgb_panel_phase_record_vsync(esp_rgb_panel_t *panel);
+static void lcd_rgb_panel_phase_record_start(esp_rgb_panel_t *panel);
+static void lcd_rgb_panel_phase_record_swap_wait(esp_rgb_panel_t *panel,
+                                                 int64_t start_us,
+                                                 uint32_t start_vsync,
+                                                 uint32_t start_wrap,
+                                                 BaseType_t result);
+#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+static void lcd_rgb_panel_phase_record_restart(esp_rgb_panel_t *panel);
+#endif
 
 struct esp_rgb_panel_t {
     esp_lcd_panel_t base;  // Base class of generic lcd panel
@@ -161,6 +210,7 @@ struct esp_rgb_panel_t {
     size_t bb_size;                 // If not-zero, the driver uses two bounce buffers allocated from internal memory
     int bounce_pos_px;              // Position in whatever source material is used for the bounce buffer, in pixels
     uint8_t *bounce_buffer[2];      // Pointer to the bounce buffers
+    lcd_rgb_phase_monitor_t phase;
     gdma_channel_handle_t dma_chan; // DMA channel handle
     qmsd_lcd_rgb_panel_vsync_cb_t on_vsync; // VSYNC event callback
     qmsd_lcd_rgb_panel_bounce_buf_fill_cb_t on_bounce_empty; // callback used to fill a bounce buffer rather than copying from the frame buffer
@@ -189,6 +239,345 @@ struct esp_rgb_panel_t {
     dma_descriptor_t dma_nodes[];      // DMA descriptors pool
 #endif
 };
+
+static esp_rgb_panel_t *s_phase_monitor_panel = NULL;
+
+static IRAM_ATTR uint32_t lcd_rgb_panel_phase_distance_px(uint32_t a, uint32_t b, uint32_t frame_px)
+{
+    uint32_t delta = a > b ? a - b : b - a;
+    if (frame_px > 0 && delta > frame_px / 2) {
+        delta = frame_px - delta;
+    }
+    return delta;
+}
+
+static IRAM_ATTR uint32_t lcd_rgb_panel_phase_tolerance_px(const esp_rgb_panel_t *panel)
+{
+    uint32_t line_px = panel && panel->timings.h_res ? panel->timings.h_res : 480;
+    return line_px * 2U;
+}
+
+static IRAM_ATTR bool lcd_rgb_panel_phase_matches_baseline(const esp_rgb_panel_t *panel,
+                                                           uint32_t pos_px,
+                                                           uint32_t *out_delta_px)
+{
+    const lcd_rgb_phase_monitor_t *phase = &panel->phase;
+    uint32_t best_delta = phase->frame_px;
+    uint32_t tolerance_px = lcd_rgb_panel_phase_tolerance_px(panel);
+
+    for (uint8_t i = 0; i < phase->baseline_pos_count; i++) {
+        uint32_t delta = lcd_rgb_panel_phase_distance_px(pos_px,
+                                                         phase->baseline_pos_px[i],
+                                                         phase->frame_px);
+        if (delta < best_delta) {
+            best_delta = delta;
+        }
+        if (delta <= tolerance_px) {
+            if (out_delta_px) {
+                *out_delta_px = delta;
+            }
+            return true;
+        }
+    }
+
+    if (out_delta_px) {
+        *out_delta_px = best_delta;
+    }
+    return false;
+}
+
+static IRAM_ATTR void lcd_rgb_panel_phase_add_baseline_pos(esp_rgb_panel_t *panel, uint32_t pos_px)
+{
+    lcd_rgb_phase_monitor_t *phase = &panel->phase;
+    uint32_t delta = 0;
+    if (phase->baseline_pos_count > 0 &&
+        lcd_rgb_panel_phase_matches_baseline(panel, pos_px, &delta)) {
+        return;
+    }
+
+    if (phase->baseline_pos_count < LCD_RGB_PHASE_BASELINE_POSITIONS) {
+        phase->baseline_pos_px[phase->baseline_pos_count++] = pos_px;
+    } else {
+        phase->baseline_overflow++;
+    }
+}
+
+static void lcd_rgb_panel_phase_init(esp_rgb_panel_t *panel)
+{
+    if (!panel) {
+        return;
+    }
+
+    memset(&panel->phase, 0, sizeof(panel->phase));
+    if (!panel->bb_size || !panel->bits_per_pixel) {
+        return;
+    }
+
+    int bytes_per_pixel = panel->bits_per_pixel / 8;
+    if (bytes_per_pixel <= 0) {
+        return;
+    }
+
+    panel->phase.frame_px = (uint32_t)(panel->fb_size / (size_t)bytes_per_pixel);
+    panel->phase.chunk_px = (uint32_t)(panel->bb_size / (size_t)bytes_per_pixel);
+}
+
+static IRAM_ATTR void lcd_rgb_panel_phase_record_eof(esp_rgb_panel_t *panel,
+                                                     int before_pos_px,
+                                                     int after_pos_px)
+{
+    if (!panel || !panel->phase.frame_px || !panel->phase.chunk_px) {
+        return;
+    }
+
+    panel->phase.eof_total++;
+    panel->phase.eof_since_vsync++;
+    if (after_pos_px < before_pos_px || after_pos_px == 0) {
+        panel->phase.frame_wrap_total++;
+        panel->phase.wraps_since_vsync++;
+    }
+}
+
+static IRAM_ATTR void lcd_rgb_panel_phase_record_start(esp_rgb_panel_t *panel)
+{
+    if (!panel || !panel->phase.frame_px || !panel->phase.chunk_px) {
+        return;
+    }
+
+    panel->phase.start_total++;
+}
+
+static void lcd_rgb_panel_phase_record_swap_wait(esp_rgb_panel_t *panel,
+                                                 int64_t start_us,
+                                                 uint32_t start_vsync,
+                                                 uint32_t start_wrap,
+                                                 BaseType_t result)
+{
+    if (!panel || !panel->phase.frame_px || start_us <= 0) {
+        return;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    if (now_us < start_us) {
+        now_us = start_us;
+    }
+    uint32_t elapsed_us = (uint32_t)(now_us - start_us);
+
+    lcd_rgb_phase_monitor_t *phase = &panel->phase;
+    phase->swap_wait_calls++;
+    phase->swap_wait_total_us += elapsed_us;
+    if (elapsed_us > phase->swap_wait_max_us) {
+        phase->swap_wait_max_us = elapsed_us;
+    }
+    if (phase->vsync_total != start_vsync) {
+        phase->swap_wait_vsync_cross++;
+    }
+    if (phase->frame_wrap_total != start_wrap) {
+        phase->swap_wait_wrap_cross++;
+    }
+    if (result != pdTRUE) {
+        phase->swap_wait_timeout++;
+    }
+}
+
+#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+static IRAM_ATTR void lcd_rgb_panel_phase_record_restart(esp_rgb_panel_t *panel)
+{
+    if (!panel || !panel->phase.frame_px || !panel->phase.chunk_px) {
+        return;
+    }
+
+    panel->phase.restart_total++;
+    panel->phase.baseline_resets++;
+}
+#endif
+
+static IRAM_ATTR void lcd_rgb_panel_phase_record_vsync(esp_rgb_panel_t *panel)
+{
+    if (!panel || !panel->phase.frame_px || !panel->phase.chunk_px) {
+        return;
+    }
+
+    lcd_rgb_phase_monitor_t *phase = &panel->phase;
+    uint32_t pos_px = panel->bounce_pos_px >= 0 ? (uint32_t)panel->bounce_pos_px : 0;
+    uint32_t eofs_since_vsync = phase->eof_since_vsync;
+    uint32_t wraps_since_vsync = phase->wraps_since_vsync;
+
+    phase->eof_since_vsync = 0;
+    phase->wraps_since_vsync = 0;
+    phase->vsync_total++;
+    phase->last_pos_px = pos_px;
+    phase->last_eofs_since_vsync = eofs_since_vsync;
+    phase->last_wraps_since_vsync = wraps_since_vsync;
+    if (phase->min_eofs_since_vsync == 0 || eofs_since_vsync < phase->min_eofs_since_vsync) {
+        phase->min_eofs_since_vsync = eofs_since_vsync;
+    }
+    if (eofs_since_vsync > phase->max_eofs_since_vsync) {
+        phase->max_eofs_since_vsync = eofs_since_vsync;
+    }
+
+    uint32_t delta_px = 0;
+    if (!phase->baseline_valid) {
+        lcd_rgb_panel_phase_add_baseline_pos(panel, pos_px);
+        if (phase->baseline_eof_min == 0 || eofs_since_vsync < phase->baseline_eof_min) {
+            phase->baseline_eof_min = eofs_since_vsync;
+        }
+        if (eofs_since_vsync > phase->baseline_eof_max) {
+            phase->baseline_eof_max = eofs_since_vsync;
+        }
+        phase->baseline_samples++;
+        phase->last_delta_px = 0;
+        if (phase->baseline_samples >= LCD_RGB_PHASE_BASELINE_SAMPLES) {
+            phase->baseline_valid = true;
+        }
+        return;
+    }
+
+    if (!lcd_rgb_panel_phase_matches_baseline(panel, pos_px, &delta_px)) {
+        phase->anomalies++;
+    }
+    if (eofs_since_vsync < phase->baseline_eof_min || eofs_since_vsync > phase->baseline_eof_max) {
+        phase->eof_anomalies++;
+    }
+    phase->last_delta_px = delta_px;
+    if (delta_px > phase->max_delta_px) {
+        phase->max_delta_px = delta_px;
+    }
+}
+
+void qmsd_lcd_rgb_panel_phase_stats_log(void)
+{
+    esp_rgb_panel_t *panel = s_phase_monitor_panel;
+    if (!panel || !panel->bb_size || !panel->phase.frame_px || !panel->phase.chunk_px) {
+        return;
+    }
+
+    lcd_rgb_phase_monitor_t *phase = &panel->phase;
+    static uint32_t last_vsync_total;
+    static uint32_t last_eof_total;
+    static uint32_t last_anomalies;
+    static uint32_t last_eof_anomalies;
+    static uint32_t last_frame_wrap_total;
+    static uint32_t last_start_total;
+    static uint32_t last_restart_total;
+    static uint32_t last_swap_wait_calls;
+    static uint32_t last_swap_wait_total_us;
+    static uint32_t last_swap_wait_vsync_cross;
+    static uint32_t last_swap_wait_wrap_cross;
+    static uint32_t last_swap_wait_timeout;
+
+    uint32_t vsync_total = phase->vsync_total;
+    uint32_t eof_total = phase->eof_total;
+    uint32_t anomalies = phase->anomalies;
+    uint32_t eof_anomalies = phase->eof_anomalies;
+    uint32_t frame_wrap_total = phase->frame_wrap_total;
+    uint32_t start_total = phase->start_total;
+    uint32_t restart_total = phase->restart_total;
+    uint32_t swap_wait_calls = phase->swap_wait_calls;
+    uint32_t swap_wait_total_us = phase->swap_wait_total_us;
+    uint32_t swap_wait_vsync_cross = phase->swap_wait_vsync_cross;
+    uint32_t swap_wait_wrap_cross = phase->swap_wait_wrap_cross;
+    uint32_t swap_wait_timeout = phase->swap_wait_timeout;
+    uint32_t phase_vsync = vsync_total - last_vsync_total;
+    uint32_t phase_eof = eof_total - last_eof_total;
+    uint32_t phase_desync = anomalies - last_anomalies;
+    uint32_t phase_eof_desync = eof_anomalies - last_eof_anomalies;
+    uint32_t phase_wraps = frame_wrap_total - last_frame_wrap_total;
+    uint32_t phase_starts = start_total - last_start_total;
+    uint32_t phase_restarts = restart_total - last_restart_total;
+    uint32_t phase_swap_wait_calls = swap_wait_calls - last_swap_wait_calls;
+    uint32_t phase_swap_wait_total_us = swap_wait_total_us - last_swap_wait_total_us;
+    uint32_t phase_swap_wait_vsync_cross = swap_wait_vsync_cross - last_swap_wait_vsync_cross;
+    uint32_t phase_swap_wait_wrap_cross = swap_wait_wrap_cross - last_swap_wait_wrap_cross;
+    uint32_t phase_swap_wait_timeout = swap_wait_timeout - last_swap_wait_timeout;
+    uint32_t phase_swap_wait_avg_us = phase_swap_wait_calls
+                                          ? phase_swap_wait_total_us / phase_swap_wait_calls
+                                          : 0;
+
+    last_vsync_total = vsync_total;
+    last_eof_total = eof_total;
+    last_anomalies = anomalies;
+    last_eof_anomalies = eof_anomalies;
+    last_frame_wrap_total = frame_wrap_total;
+    last_start_total = start_total;
+    last_restart_total = restart_total;
+    last_swap_wait_calls = swap_wait_calls;
+    last_swap_wait_total_us = swap_wait_total_us;
+    last_swap_wait_vsync_cross = swap_wait_vsync_cross;
+    last_swap_wait_wrap_cross = swap_wait_wrap_cross;
+    last_swap_wait_timeout = swap_wait_timeout;
+
+    uint32_t base0 = phase->baseline_pos_count > 0 ? phase->baseline_pos_px[0] : 0;
+    uint32_t base1 = phase->baseline_pos_count > 1 ? phase->baseline_pos_px[1] : 0;
+    uint32_t base2 = phase->baseline_pos_count > 2 ? phase->baseline_pos_px[2] : 0;
+    uint32_t base3 = phase->baseline_pos_count > 3 ? phase->baseline_pos_px[3] : 0;
+
+    ESP_LOGI(TAG,
+             "phase vsync=%lu phase_vsync=%lu eof=%lu phase_eof=%lu pos_px=%lu base_count=%u base_px=%lu,%lu,%lu,%lu base_valid=%u base_eof=%lu..%lu desync=%lu phase_desync=%lu eof_desync=%lu phase_eof_desync=%lu delta_px=%lu max_delta_px=%lu eof_since=%lu eof_range=%lu..%lu wraps=%lu phase_wraps=%lu last_wraps=%lu starts=%lu phase_starts=%lu restarts=%lu phase_restarts=%lu swap=%lu swap_avg_us=%lu swap_max_us=%lu swap_vsync=%lu swap_wrap=%lu swap_timeout=%lu chunk_px=%lu frame_px=%lu fb=%u hope=%u overflow=%lu resets=%lu",
+             (unsigned long)vsync_total,
+             (unsigned long)phase_vsync,
+             (unsigned long)eof_total,
+             (unsigned long)phase_eof,
+             (unsigned long)phase->last_pos_px,
+             (unsigned)phase->baseline_pos_count,
+             (unsigned long)base0,
+             (unsigned long)base1,
+             (unsigned long)base2,
+             (unsigned long)base3,
+             phase->baseline_valid ? 1U : 0U,
+             (unsigned long)phase->baseline_eof_min,
+             (unsigned long)phase->baseline_eof_max,
+             (unsigned long)anomalies,
+             (unsigned long)phase_desync,
+             (unsigned long)eof_anomalies,
+             (unsigned long)phase_eof_desync,
+             (unsigned long)phase->last_delta_px,
+             (unsigned long)phase->max_delta_px,
+             (unsigned long)phase->last_eofs_since_vsync,
+             (unsigned long)phase->min_eofs_since_vsync,
+             (unsigned long)phase->max_eofs_since_vsync,
+             (unsigned long)frame_wrap_total,
+             (unsigned long)phase_wraps,
+             (unsigned long)phase->last_wraps_since_vsync,
+             (unsigned long)start_total,
+             (unsigned long)phase_starts,
+             (unsigned long)restart_total,
+             (unsigned long)phase_restarts,
+             (unsigned long)phase_swap_wait_calls,
+             (unsigned long)phase_swap_wait_avg_us,
+             (unsigned long)phase->swap_wait_max_us,
+             (unsigned long)phase_swap_wait_vsync_cross,
+             (unsigned long)phase_swap_wait_wrap_cross,
+             (unsigned long)phase_swap_wait_timeout,
+             (unsigned long)phase->chunk_px,
+             (unsigned long)phase->frame_px,
+             (unsigned)panel->cur_fb_index,
+             (unsigned)panel->cur_fb_index_hope,
+             (unsigned long)phase->baseline_overflow,
+             (unsigned long)phase->baseline_resets);
+
+    if (phase_desync > 0 || phase_eof_desync > 0 ||
+        phase_restarts > 0 || phase_swap_wait_timeout > 0) {
+        ESP_LOGW(TAG,
+                 "phase-risk desync=%lu eof_desync=%lu restarts=%lu swap_timeout=%lu pos_px=%lu base_px=%lu,%lu,%lu,%lu delta_px=%lu eof_since=%lu eof_baseline=%lu..%lu wraps=%lu swap_vsync=%lu swap_wrap=%lu",
+                 (unsigned long)phase_desync,
+                 (unsigned long)phase_eof_desync,
+                 (unsigned long)phase_restarts,
+                 (unsigned long)phase_swap_wait_timeout,
+                 (unsigned long)phase->last_pos_px,
+                 (unsigned long)base0,
+                 (unsigned long)base1,
+                 (unsigned long)base2,
+                 (unsigned long)base3,
+                 (unsigned long)phase->last_delta_px,
+                 (unsigned long)phase->last_eofs_since_vsync,
+                 (unsigned long)phase->baseline_eof_min,
+                 (unsigned long)phase->baseline_eof_max,
+                 (unsigned long)phase->last_wraps_since_vsync,
+                 (unsigned long)phase_swap_wait_vsync_cross,
+                 (unsigned long)phase_swap_wait_wrap_cross);
+    }
+}
 
 static esp_err_t lcd_rgb_panel_alloc_frame_buffers(const qmsd_lcd_rgb_panel_config_t *rgb_panel_config, esp_rgb_panel_t *rgb_panel)
 {
@@ -388,6 +777,10 @@ esp_err_t qmsd_lcd_new_rgb_panel(const qmsd_lcd_rgb_panel_config_t *rgb_panel_co
     rgb_panel->flags.bb_invalidate_cache = rgb_panel_config->flags.bb_invalidate_cache;
     rgb_panel->flags.avoid_te = rgb_panel_config->flags.avoid_te;
     rgb_panel->spinlock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
+    lcd_rgb_panel_phase_init(rgb_panel);
+    if (rgb_panel->bb_size) {
+        s_phase_monitor_panel = rgb_panel;
+    }
     // fill function table
     rgb_panel->base.del = rgb_panel_del;
     rgb_panel->base.reset = rgb_panel_reset;
@@ -579,7 +972,15 @@ static esp_err_t rgb_panel_draw_bitmap(esp_lcd_panel_t *panel, int x_start, int 
 
         if (rgb_panel->flags.avoid_te) {
             xSemaphoreTake(rgb_panel->swap_ready, 0);
-            xSemaphoreTake(rgb_panel->swap_ready, portMAX_DELAY);
+            uint32_t wait_start_vsync = rgb_panel->phase.vsync_total;
+            uint32_t wait_start_wrap = rgb_panel->phase.frame_wrap_total;
+            int64_t wait_start_us = esp_timer_get_time();
+            BaseType_t wait_result = xSemaphoreTake(rgb_panel->swap_ready, portMAX_DELAY);
+            lcd_rgb_panel_phase_record_swap_wait(rgb_panel,
+                                                 wait_start_us,
+                                                 wait_start_vsync,
+                                                 wait_start_wrap,
+                                                 wait_result);
         }
 
         return ESP_OK;
@@ -817,7 +1218,10 @@ static IRAM_ATTR bool lcd_rgb_panel_eof_handler(gdma_channel_handle_t dma_chan, 
     // Note: what we receive is the *last* descriptor of this bounce buffer.
     int bb = (desc == &panel->dma_nodes[panel->num_dma_nodes - 1]) ? 0 : 1;
 #endif
-    return lcd_rgb_panel_fill_bounce_buffer(panel, panel->bounce_buffer[bb]);
+    int before_pos_px = panel->bounce_pos_px;
+    bool need_yield = lcd_rgb_panel_fill_bounce_buffer(panel, panel->bounce_buffer[bb]);
+    lcd_rgb_panel_phase_record_eof(panel, before_pos_px, panel->bounce_pos_px);
+    return need_yield;
 }
 
 // If we restart GDMA, many pixels already have been transferred to the LCD peripheral.
@@ -969,6 +1373,7 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
 #if CONFIG_LCD_RGB_RESTART_IN_VSYNC
 static IRAM_ATTR void lcd_rgb_panel_restart_transmission_in_isr(esp_rgb_panel_t *panel)
 {
+    lcd_rgb_panel_phase_record_restart(panel);
     if (panel->bb_size) {
         // Catch de-synced frame buffer and reset if needed.
         if (panel->bounce_pos_px > panel->bb_size) {
@@ -995,6 +1400,7 @@ static IRAM_ATTR void lcd_rgb_panel_restart_transmission_in_isr(esp_rgb_panel_t 
 
 static void lcd_rgb_panel_start_transmission(esp_rgb_panel_t *rgb_panel)
 {
+    lcd_rgb_panel_phase_record_start(rgb_panel);
     // reset FIFO of DMA and LCD, incase there remains old frame data
     gdma_reset(rgb_panel->dma_chan);
     lcd_ll_stop(rgb_panel->hal.dev);
@@ -1041,6 +1447,7 @@ IRAM_ATTR static void lcd_default_isr_handler(void *args)
     uint32_t intr_status = lcd_ll_get_interrupt_status(rgb_panel->hal.dev);
     lcd_ll_clear_interrupt_status(rgb_panel->hal.dev, intr_status);
     if (intr_status & LCD_LL_EVENT_VSYNC_END) {
+        lcd_rgb_panel_phase_record_vsync(rgb_panel);
 #if !CONFIG_LCD_RGB_ISR_IRAM_SAFE
         if (qmsd_gui_record_vsync) {
             qmsd_gui_record_vsync(esp_timer_get_time());
