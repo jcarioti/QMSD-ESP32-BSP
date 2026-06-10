@@ -490,9 +490,6 @@ static void qmsd_gui_render_stats_log_task(void *arg)
                      (unsigned long)snap.flush_cross_elapsed_us,
                      snap.flush_cross_recent[0] ? snap.flush_cross_recent : "unavailable");
         }
-        if (qmsd_lcd_rgb_panel_phase_stats_log) {
-            qmsd_lcd_rgb_panel_phase_stats_log();
-        }
     }
 }
 
