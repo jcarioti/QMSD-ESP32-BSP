@@ -57,6 +57,8 @@ void qmsd_gui_init(qmsd_gui_config_t* lvgl_config);
 
 void qmsd_gui_loop();
 
+void qmsd_gui_record_vsync(int64_t timestamp_us);
+
 int qmsd_gui_lock(uint32_t ticks);
 
 void qmsd_gui_unlock();

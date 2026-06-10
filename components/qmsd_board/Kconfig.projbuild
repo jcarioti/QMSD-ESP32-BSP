@@ -12,6 +12,8 @@ menu "QMSD Hal"
             bool "ZX2D10GE01R_V_4848"
         config ZX2D10CE01S_4848
             bool "ZX2D10CE01S_4848"
+        config ZX2D80CE02S_2432
+            bool "ZX2D80CE02S_2432"
         config ZX2D80CECOF_2432
             bool "ZX2D80CECOF_2432"
         config ZX3D50CE02S_USRC_4832
@@ -54,6 +56,27 @@ menu "QMSD Hal"
             ZX3D95CE01S_TR_4848 board. Disable this option to use the
             alternate 16 MHz timing table for panels that need more
             conservative RGB timing.
+
+    config QMSD_RGB_BOUNCE_BUFFER_LINES
+        int "RGB bounce buffer height in lines"
+        depends on ZX3D95CE01S_TR_4848
+        range 1 120
+        default 24 if ZX3D95CE01S_TR_4848
+        default 16
+        help
+            Number of screen lines copied into each internal-memory RGB
+            bounce buffer. The value must evenly divide the panel vertical
+            resolution. The ZX3D95CE01S_TR_4848 panel uses 24 lines to keep
+            RGB DMA refill phase stable during touch-driven redraw bursts.
+
+    config QMSD_RGB_PANEL_PHASE_TELEMETRY
+        bool "Enable RGB panel phase telemetry"
+        depends on ZX3D95CE01S_TR_4848
+        default n
+        help
+            Compile in RGB panel phase counters and diagnostic logs for
+            investigating DMA bounce-buffer timing. Leave disabled for normal
+            production builds.
 
     menu "QMSD Board Backlight"
         config QMSD_BOARD_BACKLIGHT_VALUE

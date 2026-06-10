@@ -1,15 +1,21 @@
 set(requires driver esp_lcd screen esp_timer)
 
 if("${IDF_VERSION_MAJOR}" VERSION_GREATER_EQUAL "6")
-    list(APPEND requires esp_driver_gpio)
+    list(APPEND requires esp_driver_gpio esp_driver_dma)
 endif()
 
 if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER_EQUAL "5.0")
-    list(APPEND requires esp_psram esp_timer)
+    list(APPEND requires esp_psram esp_timer qmsd_utils)
+endif()
+
+set(src_dirs lcd_panel)
+
+if (CONFIG_IDF_TARGET_ESP32S3)
+    list(APPEND src_dirs rgb_panel)
 endif()
 
 idf_component_register(
-	SRC_DIRS rgb_panel lcd_panel
-	INCLUDE_DIRS rgb_panel lcd_panel
+	SRC_DIRS ${src_dirs}
+	INCLUDE_DIRS ${src_dirs}
     REQUIRES ${requires} 
 )

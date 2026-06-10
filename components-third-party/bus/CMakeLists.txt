@@ -4,7 +4,7 @@ set(srcs
     "iic_bus.c"
     "spi_bus.c"
 )
-set(requires driver)
+set(requires driver qmsd_utils)
 
 if(IDF_VERSION_MAJOR VERSION_LESS 6)
     list(APPEND srcs "8080_lcd_esp32s3.c")

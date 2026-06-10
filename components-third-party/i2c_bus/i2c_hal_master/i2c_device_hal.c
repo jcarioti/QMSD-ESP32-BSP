@@ -148,3 +148,7 @@ int i2c_dev_read_bytes(int i2c_port, uint8_t device_addr, uint32_t reg_addr, uin
     i2c_master_bus_rm_device(dev);
     return ret;
 }
+
+i2c_master_bus_handle_t i2c_dev_get_bus_handle(int i2c_num) {
+    return g_bus_handle[i2c_num];
+}
