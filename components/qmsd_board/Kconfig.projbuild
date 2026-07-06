@@ -78,6 +78,18 @@ menu "QMSD Hal"
             investigating DMA bounce-buffer timing. Leave disabled for normal
             production builds.
 
+    config QMSD_RGB_RESTART_ON_PHASE_DESYNC
+        bool "Restart RGB stream only after phase desync"
+        depends on ZX3D95CE01S_TR_4848
+        select QMSD_RGB_PANEL_PHASE_TELEMETRY
+        default y if ZX3D95CE01S_TR_4848
+        help
+            Keep the RGB restart link available, but do not restart GDMA on
+            every VSYNC. Instead, restart only when the phase monitor detects
+            that the bounce-buffer stream has slipped away from the learned
+            frame origin. This avoids permanent scanout shifts without adding
+            a per-frame restart that can itself shift a late VSYNC frame.
+
     menu "QMSD Board Backlight"
         config QMSD_BOARD_BACKLIGHT_VALUE
             int "Init value"

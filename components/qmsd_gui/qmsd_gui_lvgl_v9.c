@@ -31,6 +31,8 @@ const char *dashboard_widget_inv_trace_recent_summary(void) __attribute__((weak)
 #define QMSD_GUI_DIRECT_RENDER_PRESSURE_LEAD_US 18000
 #define QMSD_GUI_DIRECT_RENDER_PRESSURE_MIN_REMAIN_US 17000
 #define QMSD_GUI_DIRECT_RENDER_PRESSURE_TIMER_US 1500
+#define QMSD_GUI_DIRECT_RENDER_DEFER_AFTER_TIMER_US 8000
+#define QMSD_GUI_DIRECT_RENDER_DEFER_MAX_STREAK 3
 #define QMSD_GUI_DIRECT_RENDER_PRESSURE_INV_AREAS 8
 #define QMSD_GUI_DIRECT_RENDER_PRESSURE_INV_PIXELS 40000ULL
 #define QMSD_GUI_DIRECT_RENDER_SLICE_MIN_REMAIN_US 12000
@@ -38,6 +40,7 @@ const char *dashboard_widget_inv_trace_recent_summary(void) __attribute__((weak)
 #define QMSD_GUI_DIRECT_RENDER_SLICE_FENCE_INV_PIXELS 50000ULL
 #define QMSD_GUI_DIRECT_RENDER_SLICE_FENCE_UNION_PIXELS 80000U
 #define QMSD_GUI_DIRECT_RENDER_SLICE_FENCE_FLUSH_US 15500U
+#define QMSD_GUI_DIRECT_RENDER_SLICE_YIELD_MS 1U
 #define QMSD_GUI_TIMER_TRACE_STACK_DEPTH 4
 #define QMSD_GUI_VSYNC_RISK_RECENT_LEN 192
 #define QMSD_GUI_STATS_LOG_TASK_STACK 6144
@@ -1024,18 +1027,19 @@ static void qmsd_gui_display_event_cb(lv_event_t *event)
                 (qmsd_gui_direct_render_slice_fence_needed() ||
                  flush_event_elapsed_us >= QMSD_GUI_DIRECT_RENDER_SLICE_FENCE_FLUSH_US)) {
                 int64_t slice_wait_start_us = esp_timer_get_time();
-                if (qmsd_gui_direct_render_slice_fence()) {
-                    uint32_t slice_wait_us = (uint32_t)(esp_timer_get_time() - slice_wait_start_us);
-                    if (stats_enabled) {
-                        s_render_stats.render_slice_fenced = true;
-                    }
-                    s_handler_render_slice_waits++;
-                    s_handler_render_slice_wait_total_us += slice_wait_us;
-                    if (slice_wait_us > s_handler_render_slice_wait_max_us) {
-                        s_handler_render_slice_wait_max_us = slice_wait_us;
-                    }
-                    now_us = esp_timer_get_time();
+                if (!qmsd_gui_direct_render_slice_fence()) {
+                    vTaskDelay(pdMS_TO_TICKS(QMSD_GUI_DIRECT_RENDER_SLICE_YIELD_MS));
                 }
+                uint32_t slice_wait_us = (uint32_t)(esp_timer_get_time() - slice_wait_start_us);
+                if (stats_enabled) {
+                    s_render_stats.render_slice_fenced = true;
+                }
+                s_handler_render_slice_waits++;
+                s_handler_render_slice_wait_total_us += slice_wait_us;
+                if (slice_wait_us > s_handler_render_slice_wait_max_us) {
+                    s_handler_render_slice_wait_max_us = slice_wait_us;
+                }
+                now_us = esp_timer_get_time();
             }
             if (stats_enabled) {
                 qmsd_gui_render_stats_start_render_work(QMSD_GUI_DISPLAY_EVENT_NOW_US());
@@ -1649,6 +1653,7 @@ static bool qmsd_gui_direct_render_slice_fence(void)
 
 static void gui_update_task(void* arg) {
     s_gui_update_task_handle = xTaskGetCurrentTaskHandle();
+    uint32_t defer_streak = 0;
     while (1) {
         int64_t handler_start_us = esp_timer_get_time();
         uint32_t lock_wait_us = 0;
@@ -1658,6 +1663,7 @@ static void gui_update_task(void* arg) {
         uint32_t phase_wait_us = 0;
         bool lock_taken = false;
         bool phase_synced = false;
+        bool defer_manual_refresh = false;
 
         s_handler_flush_event_total_us = 0;
         s_handler_flush_wait_total_us = 0;
@@ -1680,25 +1686,33 @@ static void gui_update_task(void* arg) {
                 uint32_t timer_elapsed_us = (uint32_t)(timer_done_us - timer_lock_acquired_us);
                 timer_handler_us += timer_elapsed_us;
                 lvgl_handler_us += timer_elapsed_us;
+                defer_manual_refresh =
+                    timer_handler_us >= QMSD_GUI_DIRECT_RENDER_DEFER_AFTER_TIMER_US &&
+                    defer_streak < QMSD_GUI_DIRECT_RENDER_DEFER_MAX_STREAK;
                 qmsd_gui_unlock();
             }
 
-            int64_t phase_wait_start_us = esp_timer_get_time();
-            phase_synced = qmsd_gui_wait_for_direct_render_vsync(
-                qmsd_gui_direct_render_pressure(timer_handler_us));
-            phase_wait_us += (uint32_t)(esp_timer_get_time() - phase_wait_start_us);
+            if (defer_manual_refresh) {
+                defer_streak++;
+            } else {
+                defer_streak = 0;
+                int64_t phase_wait_start_us = esp_timer_get_time();
+                phase_synced = qmsd_gui_wait_for_direct_render_vsync(
+                    qmsd_gui_direct_render_pressure(timer_handler_us));
+                phase_wait_us += (uint32_t)(esp_timer_get_time() - phase_wait_start_us);
 
-            int64_t refresh_lock_start_us = esp_timer_get_time();
-            if (qmsd_gui_lock(portMAX_DELAY) == 0) {
-                lock_taken = true;
-                int64_t refresh_lock_acquired_us = esp_timer_get_time();
-                lock_wait_us += (uint32_t)(refresh_lock_acquired_us - refresh_lock_start_us);
-                lv_display_refr_timer(NULL);
-                int64_t refresh_done_us = esp_timer_get_time();
-                uint32_t refresh_elapsed_us = (uint32_t)(refresh_done_us - refresh_lock_acquired_us);
-                manual_refresh_us += refresh_elapsed_us;
-                lvgl_handler_us += refresh_elapsed_us;
-                qmsd_gui_unlock();
+                int64_t refresh_lock_start_us = esp_timer_get_time();
+                if (qmsd_gui_lock(portMAX_DELAY) == 0) {
+                    lock_taken = true;
+                    int64_t refresh_lock_acquired_us = esp_timer_get_time();
+                    lock_wait_us += (uint32_t)(refresh_lock_acquired_us - refresh_lock_start_us);
+                    lv_display_refr_timer(NULL);
+                    int64_t refresh_done_us = esp_timer_get_time();
+                    uint32_t refresh_elapsed_us = (uint32_t)(refresh_done_us - refresh_lock_acquired_us);
+                    manual_refresh_us += refresh_elapsed_us;
+                    lvgl_handler_us += refresh_elapsed_us;
+                    qmsd_gui_unlock();
+                }
             }
         } else {
             int64_t lock_acquired_us = 0;

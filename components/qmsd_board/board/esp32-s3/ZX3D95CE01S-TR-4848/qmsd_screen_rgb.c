@@ -27,6 +27,12 @@ static const char *TAG = "lcd_panel.rgb";
 #define RGB_CFG_RESTART_IN_VSYNC 0
 #endif
 
+#ifdef CONFIG_QMSD_RGB_RESTART_ON_PHASE_DESYNC
+#define RGB_CFG_RESTART_ON_PHASE_DESYNC 1
+#else
+#define RGB_CFG_RESTART_ON_PHASE_DESYNC 0
+#endif
+
 #ifdef CONFIG_QMSD_SCREEN_20_MHZ_CLK
 #define RGB_CFG_SCREEN_20_MHZ 1
 #else
@@ -160,7 +166,7 @@ static void qmsd_screen_log_rgb_config(const qmsd_lcd_rgb_panel_config_t *panel_
              "pclk_active_neg=%u pclk_idle_high=%u data_width=%zu bpp=%zu "
              "fb_count=%u fb_location=%s double_fb=%u direct_mode=%d full_refresh=%d "
              "avoid_te=%u bounce_lines=%d bounce_px=%zu bounce_bytes=%zu expected_eof_since=%zu "
-             "restart_in_vsync=%d phase_telemetry=%d",
+             "restart_in_vsync=%d restart_on_phase_desync=%d phase_telemetry=%d",
              RGB_CFG_SCREEN_20_MHZ,
              (unsigned long)panel_config->timings.pclk_hz,
              (unsigned long)panel_config->timings.h_res,
@@ -186,6 +192,7 @@ static void qmsd_screen_log_rgb_config(const qmsd_lcd_rgb_panel_config_t *panel_
              bounce_bytes,
              expected_eof_since,
              RGB_CFG_RESTART_IN_VSYNC,
+             RGB_CFG_RESTART_ON_PHASE_DESYNC,
              CONFIG_QMSD_RGB_PANEL_PHASE_TELEMETRY);
 }
 #endif

@@ -126,6 +126,11 @@ static const char *TAG = "lcd_panel.rgb";
 #else
 #define RGB_PANEL_RESTART_IN_VSYNC 0
 #endif
+#if CONFIG_LCD_RGB_RESTART_IN_VSYNC || CONFIG_QMSD_RGB_RESTART_ON_PHASE_DESYNC
+#define RGB_PANEL_HAS_RESTART_RECOVERY 1
+#else
+#define RGB_PANEL_HAS_RESTART_RECOVERY 0
+#endif
 
 #if !CONFIG_LCD_RGB_ISR_IRAM_SAFE
 void qmsd_gui_record_vsync(int64_t timestamp_us) __attribute__((weak));
@@ -189,7 +194,7 @@ static void lcd_rgb_panel_start_transmission(esp_rgb_panel_t *rgb_panel);
 static void lcd_default_isr_handler(void *args);
 static void lcd_rgb_panel_phase_init(esp_rgb_panel_t *panel);
 static void lcd_rgb_panel_phase_record_eof(esp_rgb_panel_t *panel, int before_pos_px, int after_pos_px);
-static void lcd_rgb_panel_phase_record_vsync(esp_rgb_panel_t *panel);
+static bool lcd_rgb_panel_phase_record_vsync(esp_rgb_panel_t *panel);
 static void lcd_rgb_panel_phase_record_start(esp_rgb_panel_t *panel);
 static void lcd_rgb_panel_phase_record_swap_wait(esp_rgb_panel_t *panel,
                                                  int64_t start_us,
@@ -199,7 +204,7 @@ static void lcd_rgb_panel_phase_record_swap_wait(esp_rgb_panel_t *panel,
 #if CONFIG_QMSD_RGB_PANEL_PHASE_TELEMETRY
 static void lcd_rgb_panel_log_runtime_config(const esp_rgb_panel_t *panel);
 #endif
-#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+#if RGB_PANEL_HAS_RESTART_RECOVERY
 static void lcd_rgb_panel_phase_record_restart(esp_rgb_panel_t *panel);
 #endif
 
@@ -250,7 +255,7 @@ struct esp_rgb_panel_t {
     uint8_t bb_eof_count;
     gdma_link_list_handle_t dma_bb_link; // DMA link list for bounce buffer
     gdma_link_list_handle_t dma_fb_links[RGB_LCD_PANEL_MAX_FB_NUM]; // DMA link lists for multiple frame buffers
-#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+#if RGB_PANEL_HAS_RESTART_RECOVERY
     gdma_link_list_handle_t dma_restart_link; // DMA link list used to restart the transfer
 #endif
 #else
@@ -402,7 +407,7 @@ static void lcd_rgb_panel_phase_record_swap_wait(esp_rgb_panel_t *panel,
     }
 }
 
-#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+#if RGB_PANEL_HAS_RESTART_RECOVERY
 static IRAM_ATTR void lcd_rgb_panel_phase_record_restart(esp_rgb_panel_t *panel)
 {
     if (!panel || !panel->phase.frame_px || !panel->phase.chunk_px) {
@@ -414,10 +419,10 @@ static IRAM_ATTR void lcd_rgb_panel_phase_record_restart(esp_rgb_panel_t *panel)
 }
 #endif
 
-static IRAM_ATTR void lcd_rgb_panel_phase_record_vsync(esp_rgb_panel_t *panel)
+static IRAM_ATTR bool lcd_rgb_panel_phase_record_vsync(esp_rgb_panel_t *panel)
 {
     if (!panel || !panel->phase.frame_px || !panel->phase.chunk_px) {
-        return;
+        return false;
     }
 
     lcd_rgb_phase_monitor_t *phase = &panel->phase;
@@ -452,19 +457,23 @@ static IRAM_ATTR void lcd_rgb_panel_phase_record_vsync(esp_rgb_panel_t *panel)
         if (phase->baseline_samples >= LCD_RGB_PHASE_BASELINE_SAMPLES) {
             phase->baseline_valid = true;
         }
-        return;
+        return false;
     }
 
+    bool desynced = false;
     if (!lcd_rgb_panel_phase_matches_baseline(panel, pos_px, &delta_px)) {
         phase->anomalies++;
+        desynced = true;
     }
     if (eofs_since_vsync < phase->baseline_eof_min || eofs_since_vsync > phase->baseline_eof_max) {
         phase->eof_anomalies++;
+        desynced = true;
     }
     phase->last_delta_px = delta_px;
     if (delta_px > phase->max_delta_px) {
         phase->max_delta_px = delta_px;
     }
+    return desynced;
 }
 
 void qmsd_lcd_rgb_panel_phase_stats_log(void)
@@ -676,16 +685,17 @@ static inline void lcd_rgb_panel_phase_record_swap_wait(esp_rgb_panel_t *panel,
     (void)result;
 }
 
-#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+#if RGB_PANEL_HAS_RESTART_RECOVERY
 static inline IRAM_ATTR void lcd_rgb_panel_phase_record_restart(esp_rgb_panel_t *panel)
 {
     (void)panel;
 }
 #endif
 
-static inline IRAM_ATTR void lcd_rgb_panel_phase_record_vsync(esp_rgb_panel_t *panel)
+static inline IRAM_ATTR bool lcd_rgb_panel_phase_record_vsync(esp_rgb_panel_t *panel)
 {
     (void)panel;
+    return false;
 }
 
 void qmsd_lcd_rgb_panel_phase_stats_log(void)
@@ -819,7 +829,7 @@ static esp_err_t lcd_rgb_panel_destory(esp_rgb_panel_t *rgb_panel)
     if (rgb_panel->dma_bb_link) {
         gdma_del_link_list(rgb_panel->dma_bb_link);
     }
-#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+#if RGB_PANEL_HAS_RESTART_RECOVERY
     if (rgb_panel->dma_restart_link) {
         gdma_del_link_list(rgb_panel->dma_restart_link);
     }
@@ -1442,7 +1452,7 @@ static IRAM_ATTR bool lcd_rgb_panel_eof_handler(gdma_channel_handle_t dma_chan, 
 static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
 {
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 2)
-#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+#if RGB_PANEL_HAS_RESTART_RECOVERY
     size_t bytes_per_pixel = panel->bits_per_pixel / 8;
     size_t restart_skip_bytes = LCD_FIFO_PRESERVE_SIZE_PX * bytes_per_pixel;
 #endif
@@ -1471,7 +1481,7 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
             mount_cfgs[i].flags.mark_eof = true;  // we use the DMA EOF interrupt to copy the frame buffer (partially) to the bounce buffer
         }
         ESP_RETURN_ON_ERROR(gdma_link_mount_buffers(panel->dma_bb_link, 0, mount_cfgs, 2, NULL), TAG, "mount DMA bounce buffers failed");
-#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+#if RGB_PANEL_HAS_RESTART_RECOVERY
         // Match the actual first mounted node; IDF 6 shortens node lengths for buffer alignment.
         size_t restart_length = gdma_link_get_length(panel->dma_bb_link, 0);
         ESP_RETURN_ON_FALSE(restart_skip_bytes < restart_length, ESP_ERR_INVALID_ARG, TAG, "restart skip is too large for bounce buffer");
@@ -1528,7 +1538,7 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
             mount_cfg.buffer = panel->fbs[i];
             ESP_RETURN_ON_ERROR(gdma_link_mount_buffers(panel->dma_fb_links[i], 0, &mount_cfg, 1, NULL), TAG, "mount DMA frame buffer failed");
         }
-#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
+#if RGB_PANEL_HAS_RESTART_RECOVERY
         // Match the actual first mounted node; IDF 6 shortens node lengths for buffer alignment.
         size_t restart_length = gdma_link_get_length(panel->dma_fb_links[0], 0);
         ESP_RETURN_ON_FALSE(restart_skip_bytes < restart_length, ESP_ERR_INVALID_ARG, TAG, "restart skip is too large for frame buffer");
@@ -1590,7 +1600,7 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
         }
     }
 #endif
-#if CONFIG_LCD_RGB_RESTART_IN_VSYNC && (ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 3, 2))
+#if RGB_PANEL_HAS_RESTART_RECOVERY && (ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 3, 2))
     // On restart, the data sent to the LCD peripheral needs to start LCD_FIFO_PRESERVE_SIZE_PX pixels after the FB start
     // so we use a dedicated DMA node to restart the DMA transaction
     memcpy(&panel->dma_restart_node, &panel->dma_nodes[0], sizeof(panel->dma_restart_node));
@@ -1641,13 +1651,20 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
     return ESP_OK;
 }
 
-#if CONFIG_LCD_RGB_RESTART_IN_VSYNC
-static IRAM_ATTR void lcd_rgb_panel_restart_transmission_in_isr(esp_rgb_panel_t *panel)
+#if RGB_PANEL_HAS_RESTART_RECOVERY
+static IRAM_ATTR void lcd_rgb_panel_restart_transmission_in_isr(esp_rgb_panel_t *panel, bool force_frame_origin)
 {
     lcd_rgb_panel_phase_record_restart(panel);
     int bytes_per_pixel = panel->bits_per_pixel / 8;
     int bb_size_px = bytes_per_pixel > 0 ? panel->bb_size / bytes_per_pixel : 0;
     if (panel->bb_size) {
+        if (force_frame_origin) {
+            panel->bounce_pos_px = 0;
+            panel->cur_fb_index = panel->cur_fb_index_hope;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 2)
+            panel->bb_eof_count = 0;
+#endif
+        }
         // Catch de-synced frame buffer and reset if needed.
         if (panel->bounce_pos_px > bb_size_px * 2) {
             panel->bounce_pos_px = 0;
@@ -1656,6 +1673,8 @@ static IRAM_ATTR void lcd_rgb_panel_restart_transmission_in_isr(esp_rgb_panel_t 
         if (panel->bounce_pos_px < bb_size_px) {
             lcd_rgb_panel_fill_bounce_buffer(panel, panel->bounce_buffer[0]);
         }
+    } else if (force_frame_origin) {
+        panel->cur_fb_index = panel->cur_fb_index_hope;
     }
 
     lcd_ll_fifo_reset(panel->hal.dev);
@@ -1725,7 +1744,10 @@ IRAM_ATTR static void lcd_default_isr_handler(void *args)
     uint32_t intr_status = lcd_ll_get_interrupt_status(rgb_panel->hal.dev);
     lcd_ll_clear_interrupt_status(rgb_panel->hal.dev, intr_status);
     if (intr_status & LCD_LL_EVENT_VSYNC_END) {
-        lcd_rgb_panel_phase_record_vsync(rgb_panel);
+        bool phase_desynced = lcd_rgb_panel_phase_record_vsync(rgb_panel);
+        // Read only by the phase-desync restart branch below; keep other
+        // restart-config combinations warning-clean.
+        (void)phase_desynced;
 #if !CONFIG_LCD_RGB_ISR_IRAM_SAFE
         if (qmsd_gui_record_vsync) {
             qmsd_gui_record_vsync(esp_timer_get_time());
@@ -1756,7 +1778,11 @@ IRAM_ATTR static void lcd_default_isr_handler(void *args)
             // desync this leads to is preferable to the permanent desync that could otherwise
             // happen. It's also not super-likely as this interrupt has the entirety of the VBlank
             // time to reset DMA.
-            lcd_rgb_panel_restart_transmission_in_isr(rgb_panel);
+            lcd_rgb_panel_restart_transmission_in_isr(rgb_panel, false);
+#elif CONFIG_QMSD_RGB_RESTART_ON_PHASE_DESYNC
+            if (phase_desynced) {
+                lcd_rgb_panel_restart_transmission_in_isr(rgb_panel, true);
+            }
 #endif
         }
 
