@@ -114,6 +114,7 @@
 #define RGB_LCD_PANEL_MAX_FB_NUM         3 // maximum supported frame buffer number
 #define LCD_RGB_PHASE_BASELINE_SAMPLES   16
 #define LCD_RGB_PHASE_BASELINE_POSITIONS 4
+#define LCD_RGB_PHASE_DESYNC_RESTART_STREAK 2
 #define LCD_RGB_PHASE_LOG_PERIOD_MS      1000
 #define LCD_RGB_PHASE_LOG_TASK_STACK     4096
 #define LCD_RGB_PHASE_LOG_TASK_PRIORITY  1
@@ -171,6 +172,7 @@ typedef struct {
     uint32_t baseline_pos_px[LCD_RGB_PHASE_BASELINE_POSITIONS];
     uint8_t baseline_pos_count;
     uint8_t baseline_samples;
+    uint8_t desync_streak;
     bool baseline_valid;
 } lcd_rgb_phase_monitor_t;
 #endif
@@ -206,6 +208,7 @@ static void lcd_rgb_panel_log_runtime_config(const esp_rgb_panel_t *panel);
 #endif
 #if RGB_PANEL_HAS_RESTART_RECOVERY
 static void lcd_rgb_panel_phase_record_restart(esp_rgb_panel_t *panel);
+static void lcd_rgb_panel_phase_relearn_baseline(esp_rgb_panel_t *panel);
 #endif
 
 struct esp_rgb_panel_t {
@@ -417,6 +420,24 @@ static IRAM_ATTR void lcd_rgb_panel_phase_record_restart(esp_rgb_panel_t *panel)
     panel->phase.restart_total++;
     panel->phase.baseline_resets++;
 }
+
+static IRAM_ATTR void lcd_rgb_panel_phase_relearn_baseline(esp_rgb_panel_t *panel)
+{
+    if (!panel || !panel->phase.frame_px || !panel->phase.chunk_px) {
+        return;
+    }
+
+    // A forced-origin restart re-anchors scanout at a legitimate new phase, so
+    // the learned baseline no longer applies; without relearning it, every
+    // following VSYNC reads as desynced and forces another restart, forever.
+    lcd_rgb_phase_monitor_t *phase = &panel->phase;
+    phase->baseline_valid = false;
+    phase->baseline_samples = 0;
+    phase->baseline_pos_count = 0;
+    phase->baseline_eof_min = 0;
+    phase->baseline_eof_max = 0;
+    phase->desync_streak = 0;
+}
 #endif
 
 static IRAM_ATTR bool lcd_rgb_panel_phase_record_vsync(esp_rgb_panel_t *panel)
@@ -473,7 +494,16 @@ static IRAM_ATTR bool lcd_rgb_panel_phase_record_vsync(esp_rgb_panel_t *panel)
     if (delta_px > phase->max_delta_px) {
         phase->max_delta_px = delta_px;
     }
-    return desynced;
+    if (!desynced) {
+        phase->desync_streak = 0;
+        return false;
+    }
+    if (phase->desync_streak < UINT8_MAX) {
+        phase->desync_streak++;
+    }
+    // Only consecutive desynced VSYNCs justify a forced restart; a one-off
+    // anomaly is indistinguishable from ISR jitter.
+    return phase->desync_streak >= LCD_RGB_PHASE_DESYNC_RESTART_STREAK;
 }
 
 void qmsd_lcd_rgb_panel_phase_stats_log(void)
@@ -687,6 +717,11 @@ static inline void lcd_rgb_panel_phase_record_swap_wait(esp_rgb_panel_t *panel,
 
 #if RGB_PANEL_HAS_RESTART_RECOVERY
 static inline IRAM_ATTR void lcd_rgb_panel_phase_record_restart(esp_rgb_panel_t *panel)
+{
+    (void)panel;
+}
+
+static inline IRAM_ATTR void lcd_rgb_panel_phase_relearn_baseline(esp_rgb_panel_t *panel)
 {
     (void)panel;
 }
@@ -1655,6 +1690,9 @@ static esp_err_t lcd_rgb_panel_create_trans_link(esp_rgb_panel_t *panel)
 static IRAM_ATTR void lcd_rgb_panel_restart_transmission_in_isr(esp_rgb_panel_t *panel, bool force_frame_origin)
 {
     lcd_rgb_panel_phase_record_restart(panel);
+    if (force_frame_origin) {
+        lcd_rgb_panel_phase_relearn_baseline(panel);
+    }
     int bytes_per_pixel = panel->bits_per_pixel / 8;
     int bb_size_px = bytes_per_pixel > 0 ? panel->bb_size / bytes_per_pixel : 0;
     if (panel->bb_size) {
