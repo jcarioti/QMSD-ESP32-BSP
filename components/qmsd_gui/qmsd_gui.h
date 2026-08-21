@@ -63,6 +63,19 @@ int qmsd_gui_lock(uint32_t ticks);
 
 void qmsd_gui_unlock();
 
+// GUI liveness introspection. Thread-safe and non-blocking; safe from any
+// task including timer callbacks. Progress is stamped by the GUI update loop
+// each time it completes an lv_timer_handler pass under the GUI lock, so a
+// stalled stamp means the loop is wedged (typically blocked on the GUI
+// mutex). 0 means the loop has not completed a pass yet.
+uint32_t qmsd_gui_last_progress_ms(void);
+
+// Current holder of the GUI mutex as a TaskHandle_t, or NULL if unheld/uninitialized.
+void* qmsd_gui_lock_holder(void);
+
+// The GUI update task's TaskHandle_t, or NULL before the task starts.
+void* qmsd_gui_update_task(void);
+
 #ifdef __cplusplus
 }
 #endif

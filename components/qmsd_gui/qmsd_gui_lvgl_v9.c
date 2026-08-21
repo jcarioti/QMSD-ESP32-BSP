@@ -52,6 +52,8 @@ static const char *TAG = "QMSD_GUI";
 static qmsd_gui_config_t* g_lvgl_config;
 static QueueHandle_t g_image_queue;
 static SemaphoreHandle_t g_gui_semaphore = NULL;
+// 32-bit ms stamp so cross-core reads are single-word atomic on Xtensa.
+static volatile uint32_t s_gui_progress_ms = 0;
 static lv_display_t *s_lvgl_display = NULL;
 static TaskHandle_t s_gui_update_task_handle = NULL;
 static TaskHandle_t s_render_stats_log_task_handle = NULL;
@@ -1758,6 +1760,9 @@ static void gui_update_task(void* arg) {
                                              handler_flushes,
                                              phase_synced,
                                              lock_taken);
+        if (lock_taken) {
+            s_gui_progress_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        }
         if (phase_synced) {
             vTaskDelay(pdMS_TO_TICKS(1));
         } else if (handler_end > 50000) {
@@ -1858,4 +1863,16 @@ int qmsd_gui_lock(uint32_t ticks) {
 
 void qmsd_gui_unlock() {
     xSemaphoreGive(g_gui_semaphore);
+}
+
+uint32_t qmsd_gui_last_progress_ms(void) {
+    return s_gui_progress_ms;
+}
+
+void* qmsd_gui_lock_holder(void) {
+    return g_gui_semaphore ? (void*)xSemaphoreGetMutexHolder(g_gui_semaphore) : NULL;
+}
+
+void* qmsd_gui_update_task(void) {
+    return (void*)s_gui_update_task_handle;
 }
